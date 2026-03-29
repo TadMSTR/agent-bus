@@ -140,8 +140,9 @@ def query_events(
 ) -> list[dict]:
     """
     Query logged events. since is an ISO timestamp string.
-    Returns most-recent-first, capped at limit.
+    Returns most-recent-first, capped at limit (max 500).
     """
+    limit = min(limit, 500)
     suffix = "cross-agent" if scope == "cross-agent" else "session"
     events: list[dict] = []
 
