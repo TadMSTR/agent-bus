@@ -1,4 +1,4 @@
-# agent-bus-mcp
+# agent-bus
 
 A FastMCP server that provides a unified inter-agent event log for multi-agent Claude Code setups. Agents log communication events (task handoffs, audit requests, build completions) via MCP tools; events are written to local JSONL files and federated to NATS JetStream for real-time observability.
 
@@ -6,7 +6,7 @@ A FastMCP server that provides a unified inter-agent event log for multi-agent C
 
 When multiple Claude Code agents run concurrently — a dev agent, a security agent, a writer agent — they have no shared communication channel. Events like "the claudebox agent handed off a task to the security agent" exist only in session notes or memory files, with no queryable history.
 
-`agent-bus-mcp` provides a lightweight event bus:
+`agent-bus` provides a lightweight event bus:
 - Agents call `log_event` when they produce or consume work items
 - Events are indexed in JSONL files by date and scope
 - A background federation loop replays events to NATS JetStream for downstream consumers
