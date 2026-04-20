@@ -28,6 +28,9 @@ module.exports = {
         PYTHONUNBUFFERED: '1',
         NTFY_URL: envVars.NTFY_URL || '',
         NATS_URL: envVars.NATS_URL || 'nats://localhost:4222',
+        AGENT_BUS_COMMS_DIR: envVars.AGENT_BUS_COMMS_DIR || '',
+        AGENT_BUS_WEBHOOK_URL: envVars.AGENT_BUS_WEBHOOK_URL || '',
+        AGENT_BUS_WEBHOOK_EVENTS: envVars.AGENT_BUS_WEBHOOK_EVENTS || '',
       },
     },
     {
@@ -38,6 +41,10 @@ module.exports = {
       cron_restart: '*/5 * * * *',
       autorestart: false,
       watch: false,
+      env: {
+        PYTHONUNBUFFERED: '1',
+        AGENT_BUS_COMMS_DIR: envVars.AGENT_BUS_COMMS_DIR || '',
+      },
     },
     {
       name: 'agent-bus-cleanup',
@@ -47,6 +54,11 @@ module.exports = {
       cron_restart: '50 3 * * *',
       autorestart: false,
       watch: false,
+      env: {
+        AGENT_BUS_COMMS_DIR: envVars.AGENT_BUS_COMMS_DIR || '',
+        AGENT_BUS_CROSS_AGENT_RETENTION_DAYS: envVars.AGENT_BUS_CROSS_AGENT_RETENTION_DAYS || '',
+        AGENT_BUS_SESSION_RETENTION_DAYS: envVars.AGENT_BUS_SESSION_RETENTION_DAYS || '',
+      },
     },
   ],
 };
