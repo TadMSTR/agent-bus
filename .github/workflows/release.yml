@@ -1,0 +1,23 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Create release
+        uses: softprops/action-gh-release@c062e08bd532815e2082a85e87e3ef29c3e6d191 # v2.2.1
+        with:
+          generate_release_notes: false
+          body: |
+            See [CHANGELOG.md](https://github.com/TadMSTR/agent-bus/blob/main/CHANGELOG.md) for what's in this release.

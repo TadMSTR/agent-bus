@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.0] — 2026-04-20
+
 ### Added
 - `AGENT_BUS_COMMS_DIR` env var — base directory for logs, artifacts, and cursors is now
   configurable (default: `~/.claude/comms`). Propagated to `server.py`, `reconcile.py`,
