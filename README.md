@@ -1,6 +1,9 @@
 # agent-bus
 
-A FastMCP server that provides a unified inter-agent event log for multi-agent Claude Code setups. Agents log communication events (task handoffs, audit requests, build completions) via MCP tools; events are written to local JSONL files and federated to NATS JetStream for real-time observability.
+[![Built with Claude Code](https://img.shields.io/badge/Built_with-Claude_Code-6B57FF?logo=claude&logoColor=white)](https://claude.ai/code)
+[![CI](https://github.com/TadMSTR/agent-bus/actions/workflows/ci.yml/badge.svg)](https://github.com/TadMSTR/agent-bus/actions/workflows/ci.yml)
+
+A FastMCP server that provides a unified inter-agent event log for multi-agent Claude Code setups. Agents log communication events (task handoffs, audit requests, build completions) via MCP tools; events are written to local JSONL files and optionally federated to NATS JetStream for real-time observability.
 
 ## Why
 
@@ -12,6 +15,16 @@ When multiple Claude Code agents run concurrently — a dev agent, a security ag
 - A background federation loop replays events to NATS JetStream for downstream consumers
 - A reconciler catches artifacts (build plans, audit requests, handoffs) that were created without a corresponding log event
 
+## Optional Components
+
+| Component | What it adds | Required? |
+|-----------|-------------|-----------|
+| NATS JetStream | Real-time event federation; stream replay for downstream consumers | No — local JSONL log works standalone |
+| ntfy | Push notifications for high-priority events (task failures, audit requests) | No — events are still logged without it |
+| HTTP webhook | POST event JSON to any URL on matching events — integrates with n8n, Home Assistant, Make.com, or any custom API | No |
+
+The server operates fully without NATS, ntfy, and webhooks. Add them when you want real-time observability or push alerts.
+
 ## Architecture
 
 ```
@@ -21,28 +34,29 @@ Claude Code Agent
     ▼
 server.py (FastMCP, stdio transport)
     │
-    ├── append to ~/.claude/comms/logs/YYYY-MM-DD-{scope}.jsonl
+    ├── append to $AGENT_BUS_COMMS_DIR/logs/YYYY-MM-DD-{scope}.jsonl
     ├── emit_nats() — inline publish to agent-bus.{hostname}.events
-    └── emit_ntfy() — push notification for high-priority events
-          (audit.requested, task.failed, task.routing-failed, handoff.created)
+    ├── emit_ntfy() — push notification for high-priority events
+    │       (audit.requested, task.failed, task.routing-failed, handoff.created)
+    └── emit_webhook() — fire-and-forget POST to AGENT_BUS_WEBHOOK_URL
 
 Background federation loop (every 30s):
     Read logs from file+offset cursor → publish unseen events to NATS
     (gap-fill for NATS downtime; inline emit handles real-time)
 
 reconcile.py (PM2 cron, every 5 min):
-    Scan ~/.claude/comms/artifacts/ for files newer than mtime cursor
+    Scan $AGENT_BUS_COMMS_DIR/artifacts/ for files newer than mtime cursor
     → log artifact.untracked events for each file not yet in today's log
 
 cleanup.sh (PM2 cron, 3:50 AM daily):
-    Delete cross-agent logs older than 90 days
-    Delete session logs older than 30 days
+    Delete cross-agent logs older than AGENT_BUS_CROSS_AGENT_RETENTION_DAYS (default 90)
+    Delete session logs older than AGENT_BUS_SESSION_RETENTION_DAYS (default 30)
 ```
 
 ## Installation
 
 ```bash
-git clone <repo> ~/repos/agent-bus
+git clone https://github.com/TadMSTR/agent-bus ~/repos/agent-bus
 cd ~/repos/agent-bus
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
@@ -73,6 +87,20 @@ Configure as an MCP server in your Claude Desktop or Claude Code settings:
 ```
 
 `NATS_URL` and `NTFY_URL` are optional — the server operates without them (local JSONL log only).
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AGENT_BUS_COMMS_DIR` | `~/.claude/comms` | Base directory for logs, artifacts, and cursors |
+| `NATS_URL` | `nats://localhost:4222` | NATS server URL (optional) |
+| `NTFY_URL` | — | ntfy topic URL for push notifications (optional) |
+| `AGENT_BUS_CROSS_AGENT_RETENTION_DAYS` | `90` | Days to retain cross-agent log files |
+| `AGENT_BUS_SESSION_RETENTION_DAYS` | `30` | Days to retain session log files |
+| `AGENT_BUS_WEBHOOK_URL` | — | URL to POST event JSON to (optional) |
+| `AGENT_BUS_WEBHOOK_EVENTS` | — | Comma-separated event types to fire on, or `*` for all (optional) |
+
+Copy `.env.example` to `.env` and fill in the values you need. Blank values use the defaults shown above.
 
 ## MCP Tools
 
@@ -111,6 +139,12 @@ Returns events most-recent-first.
 
 Retrieve a single event by UUID.
 
+### `get_status`
+
+Returns the current server configuration and health: configured paths, which optional
+integrations are active (NATS, ntfy, webhook), date range of available logs, and
+event count for today. Use this to verify setup after installation.
+
 ## Event Vocabulary
 
 Events that automatically route to `cross-agent` scope regardless of the `scope` parameter:
@@ -139,7 +173,7 @@ For session-scoped events (memory flushes, skill executions, etc.), use `scope="
 ## Storage Layout
 
 ```
-~/.claude/comms/
+$AGENT_BUS_COMMS_DIR/          (default: ~/.claude/comms)
 ├── logs/
 │   ├── 2026-03-29-cross-agent.jsonl   # inter-agent events
 │   └── 2026-03-29-session.jsonl       # session-scoped events
@@ -201,4 +235,4 @@ The client writes directly to the JSONL files using the same schema as the serve
 - Python 3.11+
 - `fastmcp==3.1.0`
 - NATS CLI on PATH (optional, for federation)
-- `curl` on PATH (optional, for ntfy notifications)
+- `curl` on PATH (optional, for ntfy notifications and webhooks)
