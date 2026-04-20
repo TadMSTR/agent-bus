@@ -10,13 +10,13 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-COMMS_DIR = Path.home() / ".claude" / "comms"
+COMMS_DIR = Path(os.environ.get("AGENT_BUS_COMMS_DIR") or str(Path.home() / ".claude" / "comms"))
 ARTIFACTS_DIR = COMMS_DIR / "artifacts"
 LOGS_DIR = COMMS_DIR / "logs"
 CURSOR_FILE = COMMS_DIR / ".reconcile-cursor"
 HOSTNAME = os.uname().nodename
 
-# Self-healing: create log dir if missing (e.g. fresh Helm host)
+# Self-healing: create log dir if missing on first run
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 

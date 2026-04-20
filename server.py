@@ -9,10 +9,10 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
-COMMS_DIR = Path.home() / ".claude" / "comms"
+COMMS_DIR = Path(os.environ.get("AGENT_BUS_COMMS_DIR") or str(Path.home() / ".claude" / "comms"))
 LOGS_DIR = COMMS_DIR / "logs"
 
-# Ensure log directory exists on first run (self-healing for fresh Helm deployments)
+# Ensure log directory exists on first run
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -29,6 +29,10 @@ CURSOR_FILE = COMMS_DIR / "federation-cursor.json"
 HOSTNAME = os.uname().nodename
 NTFY_URL = os.environ.get("NTFY_URL", "")
 NATS_URL = os.environ.get("NATS_URL", "nats://localhost:4222")
+WEBHOOK_URL = os.environ.get("AGENT_BUS_WEBHOOK_URL", "")
+WEBHOOK_EVENTS = set(
+    e.strip() for e in os.environ.get("AGENT_BUS_WEBHOOK_EVENTS", "").split(",") if e.strip()
+)
 
 CROSS_AGENT_EVENTS = {
     "task.dispatched", "task.approved", "task.completed", "task.failed",
@@ -90,6 +94,26 @@ def emit_nats(event: dict) -> None:
         pass  # NATS unavailable — local log is authoritative
 
 
+def emit_webhook(event: dict) -> None:
+    if not WEBHOOK_URL:
+        return
+    # "*" in WEBHOOK_EVENTS matches all event types
+    if WEBHOOK_EVENTS and event["event"] not in WEBHOOK_EVENTS and "*" not in WEBHOOK_EVENTS:
+        return
+    try:
+        subprocess.run(
+            [
+                "curl", "-s", "-o", "/dev/null", "-X", "POST", WEBHOOK_URL,
+                "-H", "Content-Type: application/json",
+                "-d", json.dumps(event),
+            ],
+            timeout=5,
+            capture_output=True,
+        )
+    except Exception:
+        pass  # webhook failure never blocks event logging
+
+
 @mcp.tool()
 def log_event(
     event_type: str,
@@ -126,6 +150,7 @@ def log_event(
         emit_ntfy(event)
 
     emit_nats(event)
+    emit_webhook(event)
     return {"id": event["id"], "logged": True, "scope": scope_resolved}
 
 
@@ -184,6 +209,47 @@ def get_event(event_id: str) -> dict | None:
         except Exception:
             continue
     return None
+
+
+@mcp.tool()
+def get_status() -> dict:
+    """
+    Return the current configuration and health of the agent-bus server.
+    Useful for verifying setup after installation.
+    """
+    # Collect log file info
+    log_files = sorted(LOGS_DIR.glob("*.jsonl")) if LOGS_DIR.exists() else []
+    date_range = None
+    if log_files:
+        first = log_files[0].stem.split("-cross-agent")[0].split("-session")[0]
+        last = log_files[-1].stem.split("-cross-agent")[0].split("-session")[0]
+        date_range = {"first": first, "last": last, "files": len(log_files)}
+
+    # Count today's events
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_count = 0
+    for path in (LOGS_DIR.glob(f"{today}-*.jsonl") if LOGS_DIR.exists() else []):
+        try:
+            today_count += sum(1 for line in path.read_text().splitlines() if line.strip())
+        except Exception:
+            pass
+
+    return {
+        "comms_dir": str(COMMS_DIR),
+        "logs_dir": str(LOGS_DIR),
+        "hostname": HOSTNAME,
+        "integrations": {
+            "nats": {"enabled": bool(NATS_URL), "url": NATS_URL or None},
+            "ntfy": {"enabled": bool(NTFY_URL), "url": NTFY_URL or None},
+            "webhook": {
+                "enabled": bool(WEBHOOK_URL),
+                "url": WEBHOOK_URL or None,
+                "events": list(WEBHOOK_EVENTS) if WEBHOOK_EVENTS else ["*"] if WEBHOOK_URL else [],
+            },
+        },
+        "logs": date_range,
+        "events_today": today_count,
+    }
 
 
 # ── Federation background task ─────────────────────────────────────────────────
