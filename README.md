@@ -27,30 +27,31 @@ The server operates fully without NATS, ntfy, and webhooks. Add them when you wa
 
 ## Architecture
 
-```
-Claude Code Agent
-    │
-    │  log_event(event_type, source, target, summary, ...)
-    ▼
-server.py (FastMCP, stdio transport)
-    │
-    ├── append to $AGENT_BUS_COMMS_DIR/logs/YYYY-MM-DD-{scope}.jsonl
-    ├── emit_nats() — inline publish to agent-bus.{hostname}.events
-    ├── emit_ntfy() — push notification for high-priority events
-    │       (audit.requested, task.failed, task.routing-failed, handoff.created)
-    └── emit_webhook() — fire-and-forget POST to AGENT_BUS_WEBHOOK_URL
+```mermaid
+graph TB
+    subgraph Writers["Write Paths"]
+        Agents["Claude Code Agents\n(dev · security · writer · ...)"]
+        PyClient["agent_bus_client.py\n(PM2 cron · task-dispatcher)"]
+    end
 
-Background federation loop (every 30s):
-    Read logs from file+offset cursor → publish unseen events to NATS
-    (gap-fill for NATS downtime; inline emit handles real-time)
+    Agents -->|"log_event via MCP stdio"| Server["server.py\n(FastMCP)"]
+    PyClient -->|"direct JSONL write"| Logs
 
-reconcile.py (PM2 cron, every 5 min):
-    Scan $AGENT_BUS_COMMS_DIR/artifacts/ for files newer than mtime cursor
-    → log artifact.untracked events for each file not yet in today's log
+    Server --> Logs["JSONL logs\n$AGENT_BUS_COMMS_DIR/logs/"]
+    Server -->|"inline publish"| NATS["NATS JetStream\nagent-bus.host.events"]
+    Server -->|"high-priority events"| Ntfy["ntfy alert"]
+    Server -->|"WEBHOOK_EVENTS filter"| Webhook["HTTP webhook"]
 
-cleanup.sh (PM2 cron, 3:50 AM daily):
-    Delete cross-agent logs older than AGENT_BUS_CROSS_AGENT_RETENTION_DAYS (default 90)
-    Delete session logs older than AGENT_BUS_SESSION_RETENTION_DAYS (default 30)
+    subgraph Background["Background Processes (PM2)"]
+        Fed["federation loop · every 30s\ncursor-based gap-fill → NATS"]
+        Rec["reconcile.py · every 5 min\nscan artifacts → artifact.untracked"]
+        Clean["cleanup.sh · daily\nprune logs per retention policy"]
+    end
+
+    Logs -->|"file+offset cursor"| Fed --> NATS
+    Logs --> Clean
+
+    NATS --> Downstream["Grafana · Helm Dashboard\ndownstream agents"]
 ```
 
 ## Installation
@@ -233,6 +234,6 @@ The client writes directly to the JSONL files using the same schema as the serve
 ## Requirements
 
 - Python 3.11+
-- `fastmcp==3.1.0`
+- `fastmcp>=3.2.4`
 - NATS CLI on PATH (optional, for federation)
 - `curl` on PATH (optional, for ntfy notifications and webhooks)
