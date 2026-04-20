@@ -7,7 +7,7 @@ useDefault = true
 [[rules]]
 id = "ntfy-real-channel"
 description = "Real ntfy channel URL (internal homelab endpoints)"
-regex = '''https?://ntfy\.(your-domain|tadmstr)\.me/'''
+regex = '''https?://ntfy\.(your-domain|tadmstr|glitch42)\.(me|com)/'''
 tags = ["homelab", "internal-domain"]
 
 [[rules]]

@@ -67,13 +67,17 @@ def emit_ntfy(event: dict) -> None:
     if not NTFY_URL:
         return
     try:
+        # Strip \r\n from interpolated fields to prevent header injection
+        def _clean(s: str) -> str:
+            return s.replace("\r", "").replace("\n", " ")
+
         subprocess.run(
             [
                 "curl", "-s", "-o", "/dev/null", "-X", "POST", NTFY_URL,
-                "-H", f"Title: agent-bus: {event['event']}",
+                "-H", f"Title: agent-bus: {_clean(event['event'])}",
                 "-H", "Priority: default",
                 "-H", "Tags: agent",
-                "-d", f"{event['source']} → {event.get('target') or 'n/a'}: {event['summary']}",
+                "-d", f"{_clean(event['source'])} → {_clean(event.get('target') or 'n/a')}: {_clean(event['summary'])}",
             ],
             timeout=5,
             capture_output=True,
