@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import subprocess
 import threading
 import uuid
@@ -10,10 +11,13 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 from fastmcp import FastMCP
 
-COMMS_DIR = Path(os.environ.get("AGENT_BUS_COMMS_DIR") or str(Path.home() / ".claude" / "comms"))
+COMMS_DIR = Path(
+    os.environ.get("AGENT_BUS_COMMS_DIR") or str(Path.home() / ".claude" / "comms")
+)
 LOGS_DIR = COMMS_DIR / "logs"
 
 # Ensure log directory exists on first run
@@ -35,19 +39,33 @@ NTFY_URL = os.environ.get("NTFY_URL", "")
 NATS_URL = os.environ.get("NATS_URL", "nats://localhost:4222")
 WEBHOOK_URL = os.environ.get("AGENT_BUS_WEBHOOK_URL", "")
 WEBHOOK_EVENTS = set(
-    e.strip() for e in os.environ.get("AGENT_BUS_WEBHOOK_EVENTS", "").split(",") if e.strip()
+    e.strip()
+    for e in os.environ.get("AGENT_BUS_WEBHOOK_EVENTS", "").split(",")
+    if e.strip()
 )
 
 CROSS_AGENT_EVENTS = {
-    "task.dispatched", "task.approved", "task.completed", "task.failed",
-    "task.routing-failed", "handoff.created", "handoff.picked-up",
-    "handoff.completed", "audit.requested", "audit.completed",
+    "task.dispatched",
+    "task.approved",
+    "task.completed",
+    "task.failed",
+    "task.routing-failed",
+    "handoff.created",
+    "handoff.picked-up",
+    "handoff.completed",
+    "audit.requested",
+    "audit.completed",
     "build-plan.created",
-    "diagnose.started", "diagnose.completed", "artifact.untracked",
+    "diagnose.started",
+    "diagnose.completed",
+    "artifact.untracked",
 }
 
 HIGH_PRIORITY_EVENTS = {
-    "audit.requested", "task.failed", "task.routing-failed", "handoff.created",
+    "audit.requested",
+    "task.failed",
+    "task.routing-failed",
+    "handoff.created",
 }
 
 # ── Hash chaining ─────────────────────────────────────────────────────────────
@@ -71,6 +89,14 @@ def _last_line(path: Path) -> str | None:
 
 def _sha256(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
+
+
+def _strip_qs(url: str | None) -> str | None:
+    """Return URL with query string removed (prevents token leakage in get_status)."""
+    if not url:
+        return None
+    p = urlparse(url)
+    return urlunparse(p._replace(query="", fragment=""))
 
 
 # ── Key registry ─────────────────────────────────────────────────────────────
@@ -108,7 +134,9 @@ def _verify_signature(event: dict) -> bool:
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-        public_key = Ed25519PublicKey.from_public_bytes(base64.b64decode(public_key_b64))
+        public_key = Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(public_key_b64)
+        )
 
         # Reconstruct canonical payload — same logic as signing_hook.py
         metadata = {
@@ -162,11 +190,21 @@ def emit_ntfy(event: dict) -> None:
 
         subprocess.run(
             [
-                "curl", "-s", "-o", "/dev/null", "-X", "POST", NTFY_URL,
-                "-H", f"Title: agent-bus: {_clean(event['event'])}",
-                "-H", "Priority: default",
-                "-H", "Tags: agent",
-                "-d", f"{_clean(event['source'])} → {_clean(event.get('target') or 'n/a')}: {_clean(event['summary'])}",
+                "curl",
+                "-s",
+                "-o",
+                "/dev/null",
+                "-X",
+                "POST",
+                NTFY_URL,
+                "-H",
+                f"Title: agent-bus: {_clean(event['event'])}",
+                "-H",
+                "Priority: default",
+                "-H",
+                "Tags: agent",
+                "-d",
+                f"{_clean(event['source'])} → {_clean(event.get('target') or 'n/a')}: {_clean(event['summary'])}",
             ],
             timeout=5,
             capture_output=True,
@@ -191,14 +229,26 @@ def emit_webhook(event: dict) -> None:
     if not WEBHOOK_URL:
         return
     # "*" in WEBHOOK_EVENTS matches all event types
-    if WEBHOOK_EVENTS and event["event"] not in WEBHOOK_EVENTS and "*" not in WEBHOOK_EVENTS:
+    if (
+        WEBHOOK_EVENTS
+        and event["event"] not in WEBHOOK_EVENTS
+        and "*" not in WEBHOOK_EVENTS
+    ):
         return
     try:
         subprocess.run(
             [
-                "curl", "-s", "-o", "/dev/null", "-X", "POST", WEBHOOK_URL,
-                "-H", "Content-Type: application/json",
-                "-d", json.dumps(event),
+                "curl",
+                "-s",
+                "-o",
+                "/dev/null",
+                "-X",
+                "POST",
+                WEBHOOK_URL,
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                json.dumps(event),
             ],
             timeout=5,
             capture_output=True,
@@ -242,12 +292,19 @@ def log_event(
         valid = _verify_signature(event)
         if not valid:
             if VERIFY_SIGNATURES == "enforce":
-                return {"id": event["id"], "logged": False, "error": "signature_invalid"}
+                return {
+                    "id": event["id"],
+                    "logged": False,
+                    "error": "signature_invalid",
+                }
             # warn mode: log and continue
             import logging
+
             logging.getLogger("agent-bus").warning(
                 "signature_invalid source=%s event_type=%s id=%s",
-                source, event_type, event["id"],
+                source,
+                event_type,
+                event["id"],
             )
 
     append_event(event, scope_resolved)
@@ -333,6 +390,8 @@ def verify_chain(
     """
     if date is None:
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        raise ValueError(f"Invalid date format: {date!r} — expected YYYY-MM-DD")
     suffix = "cross-agent" if scope == "cross-agent" else "session"
     path = LOGS_DIR / f"{date}-{suffix}.jsonl"
 
@@ -413,9 +472,11 @@ def get_status() -> dict:
     # Count today's events
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     today_count = 0
-    for path in (LOGS_DIR.glob(f"{today}-*.jsonl") if LOGS_DIR.exists() else []):
+    for path in LOGS_DIR.glob(f"{today}-*.jsonl") if LOGS_DIR.exists() else []:
         try:
-            today_count += sum(1 for line in path.read_text().splitlines() if line.strip())
+            today_count += sum(
+                1 for line in path.read_text().splitlines() if line.strip()
+            )
         except Exception:
             pass
 
@@ -430,12 +491,16 @@ def get_status() -> dict:
             "verify_mode": VERIFY_SIGNATURES,
         },
         "integrations": {
-            "nats": {"enabled": bool(NATS_URL), "url": NATS_URL or None},
-            "ntfy": {"enabled": bool(NTFY_URL), "url": NTFY_URL or None},
+            "nats": {"enabled": bool(NATS_URL), "url": _strip_qs(NATS_URL)},
+            "ntfy": {"enabled": bool(NTFY_URL), "url": _strip_qs(NTFY_URL)},
             "webhook": {
                 "enabled": bool(WEBHOOK_URL),
-                "url": WEBHOOK_URL or None,
-                "events": list(WEBHOOK_EVENTS) if WEBHOOK_EVENTS else ["*"] if WEBHOOK_URL else [],
+                "url": _strip_qs(WEBHOOK_URL),
+                "events": list(WEBHOOK_EVENTS)
+                if WEBHOOK_EVENTS
+                else ["*"]
+                if WEBHOOK_URL
+                else [],
             },
         },
         "logs": date_range,
@@ -449,6 +514,7 @@ def get_status() -> dict:
 # republished by the loop. NATS JetStream dedup (2-min window, configured on AGENT_BUS
 # stream) handles recent duplicates. Inline emit is for real-time notification; loop
 # replay is gap-fill after NATS downtime. Consumers treat AGENT_BUS as at-least-once.
+
 
 def load_cursor() -> dict:
     if CURSOR_FILE.exists():
