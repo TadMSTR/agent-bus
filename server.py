@@ -99,6 +99,7 @@ def _strip_qs(url: str | None) -> str | None:
     return urlunparse(p._replace(query="", fragment=""))
 
 
+
 # ── Key registry ─────────────────────────────────────────────────────────────
 
 KEY_REGISTRY_PATH = COMMS_DIR / "agent-keys.json"
