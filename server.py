@@ -1,15 +1,23 @@
 import asyncio
+import base64
+import hashlib
 import json
 import os
+import re
 import subprocess
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 from fastmcp import FastMCP
 
-COMMS_DIR = Path(os.environ.get("AGENT_BUS_COMMS_DIR") or str(Path.home() / ".claude" / "comms"))
+COMMS_DIR = Path(
+    os.environ.get("AGENT_BUS_COMMS_DIR") or str(Path.home() / ".claude" / "comms")
+)
 LOGS_DIR = COMMS_DIR / "logs"
 
 # Ensure log directory exists on first run
@@ -31,20 +39,125 @@ NTFY_URL = os.environ.get("NTFY_URL", "")
 NATS_URL = os.environ.get("NATS_URL", "nats://localhost:4222")
 WEBHOOK_URL = os.environ.get("AGENT_BUS_WEBHOOK_URL", "")
 WEBHOOK_EVENTS = set(
-    e.strip() for e in os.environ.get("AGENT_BUS_WEBHOOK_EVENTS", "").split(",") if e.strip()
+    e.strip()
+    for e in os.environ.get("AGENT_BUS_WEBHOOK_EVENTS", "").split(",")
+    if e.strip()
 )
 
 CROSS_AGENT_EVENTS = {
-    "task.dispatched", "task.approved", "task.completed", "task.failed",
-    "task.routing-failed", "handoff.created", "handoff.picked-up",
-    "handoff.completed", "audit.requested", "audit.completed",
+    "task.dispatched",
+    "task.approved",
+    "task.completed",
+    "task.failed",
+    "task.routing-failed",
+    "handoff.created",
+    "handoff.picked-up",
+    "handoff.completed",
+    "audit.requested",
+    "audit.completed",
     "build-plan.created",
-    "diagnose.started", "diagnose.completed", "artifact.untracked",
+    "diagnose.started",
+    "diagnose.completed",
+    "artifact.untracked",
 }
 
 HIGH_PRIORITY_EVENTS = {
-    "audit.requested", "task.failed", "task.routing-failed", "handoff.created",
+    "audit.requested",
+    "task.failed",
+    "task.routing-failed",
+    "handoff.created",
 }
+
+# ── Hash chaining ─────────────────────────────────────────────────────────────
+
+_append_lock = threading.Lock()
+
+
+def _last_line(path: Path) -> str | None:
+    """Return the last non-empty line of a JSONL file, or None."""
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text()
+        for line in reversed(text.splitlines()):
+            if line.strip():
+                return line
+    except Exception:
+        pass
+    return None
+
+
+def _sha256(s: str) -> str:
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def _strip_qs(url: str | None) -> str | None:
+    """Return URL with query string removed (prevents token leakage in get_status)."""
+    if not url:
+        return None
+    p = urlparse(url)
+    return urlunparse(p._replace(query="", fragment=""))
+
+
+# ── Key registry ─────────────────────────────────────────────────────────────
+
+KEY_REGISTRY_PATH = COMMS_DIR / "agent-keys.json"
+VERIFY_SIGNATURES: str = os.environ.get("AGENT_BUS_VERIFY_SIGNATURES", "warn")
+
+
+def _load_key_registry() -> dict[str, Any]:
+    """Load public key registry from COMMS_DIR/agent-keys.json. Returns {} if absent."""
+    if not KEY_REGISTRY_PATH.exists():
+        return {}
+    try:
+        return json.loads(KEY_REGISTRY_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _verify_signature(event: dict) -> bool:
+    """Return True if signature is valid, False if invalid or keys unavailable."""
+    registry = _load_key_registry()
+    source = event.get("source", "")
+    entry = registry.get(source)
+    if not entry:
+        return True  # unknown source — accepted (backwards compatible)
+
+    sig_b64 = (event.get("metadata") or {}).get("sig", "")
+    if not sig_b64:
+        return True  # unsigned event — accepted in warn mode
+
+    public_key_b64 = entry.get("pubkey", "")
+    if not public_key_b64:
+        return True
+
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        public_key = Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(public_key_b64)
+        )
+
+        # Reconstruct canonical payload — same logic as signing_hook.py
+        metadata = {
+            k: v
+            for k, v in (event.get("metadata") or {}).items()
+            if k not in ("sig", "prev_hash")
+        }
+        payload = {
+            "event_type": event.get("event", ""),
+            "source": source,
+            "summary": event.get("summary", ""),
+            "scope": event.get("scope", "cross-agent"),
+            "target": event.get("target"),
+            "artifact_path": event.get("artifact_path"),
+            "metadata": metadata,
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        public_key.verify(base64.b64decode(sig_b64), canonical.encode())
+        return True
+    except Exception:
+        return False
 
 
 def log_path(scope: str) -> Path:
@@ -54,13 +167,17 @@ def log_path(scope: str) -> Path:
 
 
 def append_event(event: dict, scope: str) -> None:
-    """Atomic-safe JSONL append with fsync."""
+    """Atomic-safe JSONL append with prev_hash chaining and fsync."""
     path = log_path(scope)
-    line = json.dumps(event, ensure_ascii=False)
-    with open(path, "a") as f:
-        f.write(line + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+    with _append_lock:
+        last = _last_line(path)
+        if last is not None:
+            event["prev_hash"] = _sha256(last)
+        line = json.dumps(event, ensure_ascii=False)
+        with open(path, "a") as f:
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
 
 def emit_ntfy(event: dict) -> None:
@@ -73,11 +190,21 @@ def emit_ntfy(event: dict) -> None:
 
         subprocess.run(
             [
-                "curl", "-s", "-o", "/dev/null", "-X", "POST", NTFY_URL,
-                "-H", f"Title: agent-bus: {_clean(event['event'])}",
-                "-H", "Priority: default",
-                "-H", "Tags: agent",
-                "-d", f"{_clean(event['source'])} → {_clean(event.get('target') or 'n/a')}: {_clean(event['summary'])}",
+                "curl",
+                "-s",
+                "-o",
+                "/dev/null",
+                "-X",
+                "POST",
+                NTFY_URL,
+                "-H",
+                f"Title: agent-bus: {_clean(event['event'])}",
+                "-H",
+                "Priority: default",
+                "-H",
+                "Tags: agent",
+                "-d",
+                f"{_clean(event['source'])} → {_clean(event.get('target') or 'n/a')}: {_clean(event['summary'])}",
             ],
             timeout=5,
             capture_output=True,
@@ -102,14 +229,26 @@ def emit_webhook(event: dict) -> None:
     if not WEBHOOK_URL:
         return
     # "*" in WEBHOOK_EVENTS matches all event types
-    if WEBHOOK_EVENTS and event["event"] not in WEBHOOK_EVENTS and "*" not in WEBHOOK_EVENTS:
+    if (
+        WEBHOOK_EVENTS
+        and event["event"] not in WEBHOOK_EVENTS
+        and "*" not in WEBHOOK_EVENTS
+    ):
         return
     try:
         subprocess.run(
             [
-                "curl", "-s", "-o", "/dev/null", "-X", "POST", WEBHOOK_URL,
-                "-H", "Content-Type: application/json",
-                "-d", json.dumps(event),
+                "curl",
+                "-s",
+                "-o",
+                "/dev/null",
+                "-X",
+                "POST",
+                WEBHOOK_URL,
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                json.dumps(event),
             ],
             timeout=5,
             capture_output=True,
@@ -148,6 +287,26 @@ def log_event(
         "metadata": metadata or {},
     }
     scope_resolved = "cross-agent" if event_type in CROSS_AGENT_EVENTS else scope
+
+    if VERIFY_SIGNATURES in ("warn", "enforce"):
+        valid = _verify_signature(event)
+        if not valid:
+            if VERIFY_SIGNATURES == "enforce":
+                return {
+                    "id": event["id"],
+                    "logged": False,
+                    "error": "signature_invalid",
+                }
+            # warn mode: log and continue
+            import logging
+
+            logging.getLogger("agent-bus").warning(
+                "signature_invalid source=%s event_type=%s id=%s",
+                source,
+                event_type,
+                event["id"],
+            )
+
     append_event(event, scope_resolved)
 
     if event_type in HIGH_PRIORITY_EVENTS:
@@ -216,6 +375,87 @@ def get_event(event_id: str) -> dict | None:
 
 
 @mcp.tool()
+def verify_chain(
+    scope: str = "cross-agent",
+    date: str | None = None,
+) -> dict:
+    """Walk a JSONL log file and verify its hash chain and signatures.
+
+    Args:
+        scope: "cross-agent" or "session" (determines file suffix).
+        date:  ISO date string (YYYY-MM-DD). Defaults to today.
+
+    Returns a summary dict with counts: verified, chain_breaks, sig_failures,
+    unsigned_events, total_events.
+    """
+    if date is None:
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        raise ValueError(f"Invalid date format: {date!r} — expected YYYY-MM-DD")
+    suffix = "cross-agent" if scope == "cross-agent" else "session"
+    path = LOGS_DIR / f"{date}-{suffix}.jsonl"
+
+    if not path.exists():
+        return {
+            "file": str(path),
+            "error": "file_not_found",
+            "total_events": 0,
+        }
+
+    registry = _load_key_registry()
+    total = 0
+    chain_breaks = 0
+    sig_failures = 0
+    unsigned_events = 0
+    prev_line: str | None = None
+
+    try:
+        lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+    except Exception as exc:
+        return {"file": str(path), "error": str(exc), "total_events": 0}
+
+    for line in lines:
+        total += 1
+        try:
+            event = json.loads(line)
+        except Exception:
+            chain_breaks += 1
+            prev_line = line
+            continue
+
+        # Verify hash chain
+        declared_prev = event.get("prev_hash")
+        if prev_line is not None:
+            expected_prev = _sha256(prev_line)
+            if declared_prev != expected_prev:
+                chain_breaks += 1
+        elif declared_prev is not None:
+            # First event should have no prev_hash
+            chain_breaks += 1
+
+        # Verify signature
+        source = event.get("source", "")
+        if source in registry:
+            sig = (event.get("metadata") or {}).get("sig", "")
+            if not sig:
+                unsigned_events += 1
+            elif not _verify_signature(event):
+                sig_failures += 1
+
+        prev_line = line
+
+    verified = total - chain_breaks - sig_failures - unsigned_events
+    return {
+        "file": str(path),
+        "total_events": total,
+        "verified": verified,
+        "chain_breaks": chain_breaks,
+        "sig_failures": sig_failures,
+        "unsigned_events": unsigned_events,
+    }
+
+
+@mcp.tool()
 def get_status() -> dict:
     """
     Return the current configuration and health of the agent-bus server.
@@ -232,23 +472,35 @@ def get_status() -> dict:
     # Count today's events
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     today_count = 0
-    for path in (LOGS_DIR.glob(f"{today}-*.jsonl") if LOGS_DIR.exists() else []):
+    for path in LOGS_DIR.glob(f"{today}-*.jsonl") if LOGS_DIR.exists() else []:
         try:
-            today_count += sum(1 for line in path.read_text().splitlines() if line.strip())
+            today_count += sum(
+                1 for line in path.read_text().splitlines() if line.strip()
+            )
         except Exception:
             pass
+
+    key_registry = _load_key_registry()
 
     return {
         "comms_dir": str(COMMS_DIR),
         "logs_dir": str(LOGS_DIR),
         "hostname": HOSTNAME,
+        "signing": {
+            "registered_agents": list(key_registry.keys()),
+            "verify_mode": VERIFY_SIGNATURES,
+        },
         "integrations": {
-            "nats": {"enabled": bool(NATS_URL), "url": NATS_URL or None},
-            "ntfy": {"enabled": bool(NTFY_URL), "url": NTFY_URL or None},
+            "nats": {"enabled": bool(NATS_URL), "url": _strip_qs(NATS_URL)},
+            "ntfy": {"enabled": bool(NTFY_URL), "url": _strip_qs(NTFY_URL)},
             "webhook": {
                 "enabled": bool(WEBHOOK_URL),
-                "url": WEBHOOK_URL or None,
-                "events": list(WEBHOOK_EVENTS) if WEBHOOK_EVENTS else ["*"] if WEBHOOK_URL else [],
+                "url": _strip_qs(WEBHOOK_URL),
+                "events": list(WEBHOOK_EVENTS)
+                if WEBHOOK_EVENTS
+                else ["*"]
+                if WEBHOOK_URL
+                else [],
             },
         },
         "logs": date_range,
@@ -262,6 +514,7 @@ def get_status() -> dict:
 # republished by the loop. NATS JetStream dedup (2-min window, configured on AGENT_BUS
 # stream) handles recent duplicates. Inline emit is for real-time notification; loop
 # replay is gap-fill after NATS downtime. Consumers treat AGENT_BUS as at-least-once.
+
 
 def load_cursor() -> dict:
     if CURSOR_FILE.exists():
