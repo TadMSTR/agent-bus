@@ -166,6 +166,13 @@ Events that automatically route to `cross-agent` scope regardless of the `scope`
 | `diagnose.started` | Diagnostic session begun |
 | `diagnose.completed` | Diagnostic session concluded |
 | `artifact.untracked` | File in artifacts dir with no log entry (reconciler) |
+| `preflight.started` | Build preflight check begun |
+| `preflight.completed` | Build preflight check finished |
+| `build.started` | Build phase execution begun |
+| `build.completed` | Build phase execution finished |
+| `deploy.started` | Deployment begun |
+| `deploy.completed` | Deployment finished |
+| `security.finding` | Security agent logged a finding |
 
 High-priority events that also trigger a push notification: `audit.requested`, `task.failed`, `task.routing-failed`, `handoff.created`.
 
