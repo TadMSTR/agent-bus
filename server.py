@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -12,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
+
+_log = logging.getLogger("agent-bus")
 
 from fastmcp import FastMCP
 
@@ -59,6 +62,13 @@ CROSS_AGENT_EVENTS = {
     "diagnose.started",
     "diagnose.completed",
     "artifact.untracked",
+    "preflight.started",
+    "preflight.completed",
+    "build.started",
+    "build.completed",
+    "deploy.started",
+    "deploy.completed",
+    "security.finding",
 }
 
 HIGH_PRIORITY_EVENTS = {
@@ -568,8 +578,8 @@ async def federation_loop() -> None:
                             continue
 
             save_cursor(cursor)
-        except Exception:
-            pass  # federation failure never blocks the server
+        except Exception as exc:
+            _log.warning("federation_loop error: %s", exc)
 
         await asyncio.sleep(30)
 
