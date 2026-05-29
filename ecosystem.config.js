@@ -31,6 +31,7 @@ module.exports = {
         AGENT_BUS_COMMS_DIR: envVars.AGENT_BUS_COMMS_DIR || '',
         AGENT_BUS_WEBHOOK_URL: envVars.AGENT_BUS_WEBHOOK_URL || '',
         AGENT_BUS_WEBHOOK_EVENTS: envVars.AGENT_BUS_WEBHOOK_EVENTS || '',
+        AGENT_BUS_VERIFY_SIGNATURES: envVars.AGENT_BUS_VERIFY_SIGNATURES || 'warn',
       },
     },
     {
