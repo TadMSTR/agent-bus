@@ -28,6 +28,7 @@ module.exports = {
         PYTHONUNBUFFERED: '1',
         NTFY_URL: envVars.NTFY_URL || '',
         NATS_URL: envVars.NATS_URL || 'nats://localhost:4222',
+        NATS_AGENT_BUS_PASSWORD: envVars.NATS_AGENT_BUS_PASSWORD || '',
         AGENT_BUS_COMMS_DIR: envVars.AGENT_BUS_COMMS_DIR || '',
         AGENT_BUS_WEBHOOK_URL: envVars.AGENT_BUS_WEBHOOK_URL || '',
         AGENT_BUS_WEBHOOK_EVENTS: envVars.AGENT_BUS_WEBHOOK_EVENTS || '',

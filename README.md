@@ -38,7 +38,7 @@ graph TB
     PyClient -->|"direct JSONL write"| Logs
 
     Server --> Logs["JSONL logs\n$AGENT_BUS_COMMS_DIR/logs/"]
-    Server -->|"inline publish"| NATS["NATS JetStream\nagent-bus.host.events"]
+    Server -->|"inline publish"| NATS["NATS JetStream\nevents.agent-bus.host"]
     Server -->|"high-priority events"| Ntfy["ntfy alert"]
     Server -->|"WEBHOOK_EVENTS filter"| Webhook["HTTP webhook"]
 

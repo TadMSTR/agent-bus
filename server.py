@@ -40,6 +40,7 @@ CURSOR_FILE = COMMS_DIR / "federation-cursor.json"
 HOSTNAME = os.uname().nodename
 NTFY_URL = os.environ.get("NTFY_URL", "")
 NATS_URL = os.environ.get("NATS_URL", "nats://localhost:4222")
+NATS_AGENT_BUS_PASSWORD = os.environ.get("NATS_AGENT_BUS_PASSWORD", "")
 WEBHOOK_URL = os.environ.get("AGENT_BUS_WEBHOOK_URL", "")
 WEBHOOK_EVENTS = set(
     e.strip()
@@ -225,10 +226,18 @@ def emit_ntfy(event: dict) -> None:
 
 
 def emit_nats(event: dict) -> None:
+    if not NATS_AGENT_BUS_PASSWORD:
+        return  # no credentials configured — NATS server requires auth, don't retry forever
     try:
-        subject = f"agent-bus.{HOSTNAME}.events"
+        subject = f"events.agent-bus.{HOSTNAME}"
         subprocess.run(
-            ["nats", "pub", "--server", NATS_URL, subject, json.dumps(event)],
+            [
+                "nats", "pub",
+                "--server", NATS_URL,
+                "--user", "agent-bus",
+                "--password", NATS_AGENT_BUS_PASSWORD,
+                subject, json.dumps(event),
+            ],
             timeout=5,
             capture_output=True,
         )
