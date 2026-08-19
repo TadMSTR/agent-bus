@@ -229,6 +229,98 @@ def test_v1_signature_still_accepted(comms_dir, monkeypatch):
     assert result["logged"] is True
 
 
+# ── nonce cache eviction (audit 2026-08-19, LOW) ──────────────────────────────
+
+
+def _replay_event(nonce, sig_ts=None):
+    """A v2-shaped event for _check_replay. Signature policy is checked elsewhere."""
+    return {
+        "metadata": {
+            "sig_v": 2,
+            "sig_ts": sig_ts or datetime.now(timezone.utc).isoformat(),
+            "sig_nonce": nonce,
+        }
+    }
+
+
+def test_nonce_flood_cannot_evict_a_legitimate_nonce(comms_dir):
+    """The attack the finding describes: flood distinct nonces, then replay the target.
+
+    Under the old insertion-order FIFO against a 4096 bound, ~5000 nonces pushed the
+    victim out and the replay was then accepted. Expired entries are now pruned by age
+    and the cap is well above plausible volume, so the victim survives.
+    """
+    ab._seen_nonces.clear()
+    assert ab._check_replay(_replay_event("victim")) is None
+
+    for i in range(5000):  # would have overflowed the old 4096-entry FIFO
+        ab._check_replay(_replay_event(f"flood{i}"))
+
+    assert ab._check_replay(_replay_event("victim")) == "nonce_reused"
+
+
+def test_eviction_at_the_hard_cap_is_still_possible_and_is_logged(comms_dir, monkeypatch, caplog):
+    """Residual risk, pinned deliberately rather than left implicit.
+
+    The cap is a memory backstop and it still drops the oldest entry. Failing closed
+    instead would be worse: _check_signature rejecting means log_event never appends, so
+    a flood would destroy audit events rather than merely widen a replay window. The
+    defence is that the cap sits far above plausible volume, and that reaching it is
+    logged rather than silently degrading the control.
+    """
+    ab._seen_nonces.clear()
+    monkeypatch.setattr(ab, "_SEEN_NONCE_LIMIT", 4)
+
+    assert ab._check_replay(_replay_event("victim")) is None
+    with caplog.at_level("WARNING"):
+        for i in range(10):
+            ab._check_replay(_replay_event(f"flood{i}"))
+
+    assert ab._check_replay(_replay_event("victim")) is None  # evicted, replay accepted
+    assert any("nonce cache hit its" in r.message for r in caplog.records)
+
+
+def test_nonces_are_dropped_once_they_age_out(comms_dir):
+    """The cache must not grow without bound just because eviction is time-based."""
+    ab._seen_nonces.clear()
+    now = 1_000.0
+    ab._seen_nonces["old"] = now - ab.SIG_MAX_AGE_SECONDS - 1
+    ab._seen_nonces["fresh"] = now - 1
+
+    ab._prune_nonces(now)
+
+    assert "old" not in ab._seen_nonces
+    assert "fresh" in ab._seen_nonces
+
+
+def test_pruning_stops_at_the_first_live_entry(comms_dir):
+    ab._seen_nonces.clear()
+    now = 1_000.0
+    for i in range(5):
+        ab._seen_nonces[f"live{i}"] = now - 1
+
+    ab._prune_nonces(now)
+
+    assert len(ab._seen_nonces) == 5
+
+
+def test_an_expired_nonce_is_not_replayable_anyway(comms_dir, monkeypatch):
+    """Eviction by age is only safe because the sig_ts check rejects the same event."""
+    private, pubkey = _keypair()
+    _register(comms_dir, "research", pubkey)
+    monkeypatch.setattr(ab, "VERIFY_SIGNATURES", "enforce")
+
+    stale = (datetime.now(timezone.utc) - timedelta(seconds=ab.SIG_MAX_AGE_SECONDS + 1)).isoformat()
+    metadata = _signed_v2(private, sig_ts=stale)
+
+    result = ab.log_event(
+        event_type="task.completed", source="research", summary="s", metadata=metadata
+    )
+
+    assert result["logged"] is False
+    assert result["error"] == "sig_expired"
+
+
 # ── credential redaction ──────────────────────────────────────────────────────
 
 

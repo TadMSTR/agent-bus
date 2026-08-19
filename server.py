@@ -134,7 +134,13 @@ VERIFY_SIGNATURES: str = os.environ.get("AGENT_BUS_VERIFY_SIGNATURES", "warn")
 
 # Replay window for signature version 2+. See _check_replay.
 SIG_MAX_AGE_SECONDS = _env_num("AGENT_BUS_SIG_MAX_AGE", 300, int)
-_SEEN_NONCE_LIMIT = 4096
+
+# Seen nonces, keyed by nonce with the monotonic time they were first accepted. Entries
+# are evicted when they age out of the freshness window (see _prune_nonces), so eviction
+# is driven by the clock rather than by insertion volume. The hard cap below is only a
+# memory backstop; at forge's observed rate (~40 cross-agent events/day) a 300s window
+# holds single digits, so it should never be reached in normal operation.
+_SEEN_NONCE_LIMIT = 16384
 _seen_nonces: OrderedDict[str, float] = OrderedDict()
 
 
@@ -220,12 +226,43 @@ def _check_replay(event: dict) -> str | None:
     if abs(now - signed_at) > timedelta(seconds=SIG_MAX_AGE_SECONDS):
         return "sig_expired"
 
+    now_mono = time.monotonic()
+    _prune_nonces(now_mono)
     if nonce in _seen_nonces:
         return "nonce_reused"
-    _seen_nonces[nonce] = time.monotonic()
-    while len(_seen_nonces) > _SEEN_NONCE_LIMIT:
+    _seen_nonces[nonce] = now_mono
+    if len(_seen_nonces) > _SEEN_NONCE_LIMIT:
+        # Memory backstop only — reaching this means unexpected volume, and dropping the
+        # oldest entry is the one case where eviction is still attacker-influenceable.
+        # Log it rather than shedding replay protection silently.
         _seen_nonces.popitem(last=False)
+        _log.warning(
+            "nonce cache hit its %d-entry cap — replay protection degraded for evicted "
+            "nonces still inside the %ds window",
+            _SEEN_NONCE_LIMIT,
+            SIG_MAX_AGE_SECONDS,
+        )
     return None
+
+
+def _prune_nonces(now_mono: float) -> None:
+    """Drop nonces that have aged out of the freshness window.
+
+    Eviction used to be pure insertion-order FIFO against a fixed bound, so an attacker
+    able to submit signed events could flood distinct nonces to evict one specific
+    legitimate nonce and then replay that event inside the still-open window
+    (audit 2026-08-19, LOW). Expiring by age instead puts eviction under the clock, which
+    the attacker does not control: a nonce can only leave the cache once replaying it
+    would already fail the sig_ts freshness check.
+
+    Insertion order is monotonic-time order, so the expired entries are always a prefix.
+    """
+    cutoff = now_mono - SIG_MAX_AGE_SECONDS
+    while _seen_nonces:
+        _, seen_at = next(iter(_seen_nonces.items()))
+        if seen_at > cutoff:
+            break
+        _seen_nonces.popitem(last=False)
 
 
 def _check_signature(event: dict) -> tuple[bool, str | None]:

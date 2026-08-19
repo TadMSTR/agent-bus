@@ -113,6 +113,18 @@ ntfy and webhook delivery shell out to `curl`; there is no HTTP client dependenc
   `metadata`, declared by `sig_v: 2`. Signers that predate that are accepted but cannot
   be replay-checked.
 
+- **What replay protection actually guarantees.** State it precisely, because the nonce
+  half is weaker than it looks: the seen-nonce set is **per process**, and agent-bus runs
+  as the PM2 service plus one stdio child per scoped-mcp broker. An event replayed to a
+  *different* process than the one that first saw it will not be caught by the nonce
+  check. The guarantee that holds across all processes is the cryptographically-signed
+  `sig_ts` freshness window — **"valid signature, seen at most once per process, and at
+  most ±`AGENT_BUS_SIG_MAX_AGE` old"** (default 300s, ± because clock skew between agents
+  is tolerated). Size `AGENT_BUS_SIG_MAX_AGE` to the replay exposure you are willing to
+  accept, not to the nonce cache. Sharing the nonce set across processes was considered
+  and rejected: it puts locked file I/O on the hot path of every signed event for all
+  seven agents. Revisit when vikunja#434 makes any of this live.
+
 ## Testing
 
 ```bash

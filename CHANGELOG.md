@@ -33,6 +33,16 @@ vikunja#432 (federation cursor) and vikunja#431 (steward credential, deployed se
 
 ### Fixed
 
+- **Nonce eviction no longer lets an attacker choose what gets evicted** (security audit
+  2026-08-19, Low). Eviction was insertion-order FIFO against a 4096-entry bound, so a party
+  able to submit signed events could flood distinct nonces to push one specific legitimate
+  nonce out and then replay that event inside the still-open freshness window. Entries are
+  now pruned once they age out of `AGENT_BUS_SIG_MAX_AGE`, which puts eviction under the
+  clock rather than under submission volume, and the cap is raised to 16384 as a pure memory
+  backstop. Reaching that cap still drops the oldest entry — failing closed instead would be
+  worse, since a rejected event is never appended at all, so a flood would destroy audit
+  records rather than merely widen a replay window — and it is now logged rather than
+  silently degrading the control.
 - **Federation no longer replays the entire event history every cycle.** The cursor held a
   single `(file, offset)` pair while the loop iterated all ~70 daily files, so every file
   that was not the cursor's file restarted at offset 0 — roughly 2,700 events republished
