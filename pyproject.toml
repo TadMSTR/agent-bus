@@ -1,16 +1,64 @@
 [project]
 name = "agent-bus"
-version = "0.2.0"
+version = "0.3.0"
 description = "Inter-agent event bus with hash-chained JSONL logs and NATS federation"
 requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=3.2.4,<4",
     "cryptography>=41.0",
+    "nats-py>=2.6",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.1",
+    "ruff>=0.6",
+    "build>=1.0",
+    "pip-audit>=2.7",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
+
+# Flat layout (accepted deviation from the src/<pkg>/ standard — see CHANGELOG).
+# Auto-discovery cannot resolve multiple top-level modules, so declare them explicitly.
+[tool.setuptools]
+py-modules = [
+    "server",
+    "reconcile",
+    "agent_bus_client",
+    "event_log",
+    "event_vocab",
+    "nats_publisher",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+# Flat layout: these are first-party modules, not site-packages.
+[tool.ruff.lint.isort]
+known-first-party = [
+    "server",
+    "reconcile",
+    "agent_bus_client",
+    "event_log",
+    "event_vocab",
+    "nats_publisher",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["."]
+omit = ["tests/*", "venv/*", "*/site-packages/*"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true

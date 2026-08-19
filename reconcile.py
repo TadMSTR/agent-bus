@@ -3,12 +3,18 @@
 reconcile.py — scan ~/.claude/comms/artifacts/ for files not yet in today's cross-agent log.
 Runs every 5 minutes via PM2 cron. Writes directly to JSONL (not via MCP) since it IS
 the agent-bus reconciliation path.
+
+Appends through ``event_log`` so its events chain and lock like every other writer's.
+It previously appended raw, with no ``prev_hash`` and no lock — which meant a PM2 cron
+firing while the server was writing could interleave and break the chain outright.
 """
+
 import json
 import os
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
+
+from event_log import append_event, build_event
+from event_log import log_path as _log_path
 
 COMMS_DIR = Path(os.environ.get("AGENT_BUS_COMMS_DIR") or str(Path.home() / ".claude" / "comms"))
 ARTIFACTS_DIR = COMMS_DIR / "artifacts"
@@ -21,7 +27,7 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def log_path() -> Path:
-    return LOGS_DIR / f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}-cross-agent.jsonl"
+    return _log_path("cross-agent", LOGS_DIR)
 
 
 def known_artifact_paths() -> set[str]:
@@ -57,20 +63,15 @@ def main() -> None:
         if path_str in known:
             continue
 
-        event = {
-            "id": str(uuid.uuid4()),
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "event": "artifact.untracked",
-            "scope": "cross-agent",
-            "source": "reconciliation",
-            "target": None,
-            "artifact_path": path_str,
-            "summary": f"Untracked artifact: {f.name}",
-            "hostname": HOSTNAME,
-            "metadata": {},
-        }
-        with open(log_path(), "a") as lf:
-            lf.write(json.dumps(event) + "\n")
+        event = build_event(
+            event_type="artifact.untracked",
+            source="reconciliation",
+            summary=f"Untracked artifact: {f.name}",
+            scope="cross-agent",
+            artifact_path=path_str,
+            hostname=HOSTNAME,
+        )
+        append_event(event, "cross-agent", LOGS_DIR)
         found += 1
 
     CURSOR_FILE.touch()

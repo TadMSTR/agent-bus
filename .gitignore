@@ -6,3 +6,9 @@ venv/
 *.log
 core.*
 *.core
+venv-dev/
+dist/
+build/
+*.egg-info/
+.coverage
+htmlcov/
