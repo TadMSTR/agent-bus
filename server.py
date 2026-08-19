@@ -229,7 +229,7 @@ def emit_nats(event: dict) -> None:
     if not NATS_AGENT_BUS_PASSWORD:
         return  # no credentials configured — NATS server requires auth, don't retry forever
     try:
-        subject = f"agent-bus.{HOSTNAME}.events"
+        subject = f"events.agent-bus.{HOSTNAME}"
         subprocess.run(
             [
                 "nats", "pub",
