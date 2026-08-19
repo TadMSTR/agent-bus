@@ -3,11 +3,10 @@
 import json
 import threading
 import time
-from pathlib import Path
 
 import pytest
-import server as ab
 
+import server as ab
 
 # ── log_event ────────────────────────────────────────────────────────────────
 
@@ -46,7 +45,7 @@ def test_log_event_hash_chain_links_events(comms_dir):
     ab.log_event(event_type="task.completed", source="dev", summary="second")
 
     log_file = sorted((comms_dir / "logs").glob("*-cross-agent.jsonl"))[0]
-    lines = [l for l in log_file.read_text().splitlines() if l.strip()]
+    lines = [ln for ln in log_file.read_text().splitlines() if ln.strip()]
     assert len(lines) == 2
 
     first = json.loads(lines[0])
@@ -77,6 +76,7 @@ def test_verify_chain_clean(comms_dir):
     ab.log_event(event_type="task.completed", source="dev", summary="b")
 
     from datetime import datetime, timezone
+
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     result = ab.verify_chain(scope="cross-agent", date=today)
 
@@ -98,6 +98,7 @@ def test_verify_chain_detects_tampered_hash(comms_dir):
     log_file.write_text("\n".join(lines) + "\n")
 
     from datetime import datetime, timezone
+
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     result = ab.verify_chain(scope="cross-agent", date=today)
     assert result["chain_breaks"] >= 1
@@ -209,7 +210,7 @@ def test_append_event_lock_prevents_interleave(comms_dir):
     assert not errors
 
     log_file = sorted((comms_dir / "logs").glob("*-cross-agent.jsonl"))[0]
-    lines = [l for l in log_file.read_text().splitlines() if l.strip()]
+    lines = [ln for ln in log_file.read_text().splitlines() if ln.strip()]
     # Every line must be valid JSON
     for line in lines:
         json.loads(line)  # raises if malformed

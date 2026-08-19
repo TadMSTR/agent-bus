@@ -5,6 +5,15 @@ For Python scripts that can't call MCP directly (e.g. PM2 cron jobs,
 task dispatchers), this module writes events to the same JSONL files
 as the server — no MCP round-trip, no external dependency.
 
+It writes through ``event_log``, so events land chained and flock-guarded exactly as
+the server writes them. Previously it appended with no ``prev_hash`` and no lock, which
+is one of the two reasons ``verify_chain`` reported breaks during normal operation.
+
+The event vocabulary comes from ``event_vocab`` rather than a local copy. The local
+copy had gone stale — it was missing ``preflight.*``, ``build.*``, ``deploy.*`` and
+``security.finding``, so callers logging ``build.completed`` silently landed in the
+session file, invisible to ``query_events(scope="cross-agent")`` and never federated.
+
 Usage:
     from agent_bus_client import log_event
 
@@ -15,22 +24,17 @@ Usage:
         summary="Build phase 1 dispatched",
     )
 """
-import json
+
 import os
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
+
+from event_log import append_event, build_event
+from event_vocab import CROSS_AGENT_EVENTS, resolve_scope
+
+__all__ = ["CROSS_AGENT_EVENTS", "log_event", "resolve_scope"]
 
 COMMS_DIR = Path(os.environ.get("AGENT_BUS_COMMS_DIR") or str(Path.home() / ".claude" / "comms"))
 LOGS_DIR = COMMS_DIR / "logs"
-
-CROSS_AGENT_EVENTS = {
-    "task.dispatched", "task.approved", "task.completed", "task.failed",
-    "task.routing-failed", "handoff.created", "handoff.picked-up",
-    "handoff.completed", "audit.requested", "audit.completed",
-    "build-plan.created", "diagnose.started", "diagnose.completed",
-    "artifact.untracked",
-}
 
 
 def log_event(
@@ -45,32 +49,16 @@ def log_event(
     """
     Write an event directly to the JSONL log. Returns the event dict with assigned id.
     Uses the same schema as the MCP server — events written here are visible to
-    query_events and get_event tool calls.
+    query_events and get_event tool calls, and chain onto the preceding event.
     """
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-    hostname = os.uname().nodename
-    scope_resolved = "cross-agent" if event_type in CROSS_AGENT_EVENTS else scope
-    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    suffix = "cross-agent" if scope_resolved == "cross-agent" else "session"
-    log_path = LOGS_DIR / f"{date}-{suffix}.jsonl"
-
-    event = {
-        "id": str(uuid.uuid4()),
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "event": event_type,
-        "scope": scope_resolved,
-        "source": source,
-        "target": target,
-        "artifact_path": str(artifact_path) if artifact_path else None,
-        "summary": summary,
-        "hostname": hostname,
-        "metadata": metadata or {},
-    }
-
-    with open(log_path, "a") as f:
-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-
+    event = build_event(
+        event_type=event_type,
+        source=source,
+        summary=summary,
+        scope=scope,
+        target=target,
+        artifact_path=artifact_path,
+        metadata=metadata,
+    )
+    append_event(event, event["scope"], LOGS_DIR)
     return event
