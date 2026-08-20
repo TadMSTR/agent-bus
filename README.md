@@ -11,8 +11,10 @@ When multiple Claude Code agents run concurrently — a dev agent, a security ag
 
 `agent-bus` provides a lightweight event bus:
 - Agents call `log_event` when they produce or consume work items
-- Events are indexed in JSONL files by date and scope
-- A background federation loop replays events to NATS JetStream for downstream consumers
+- Events are indexed in JSONL files by date and scope, chain-hashed so the log is tamper-evident
+- A background federation loop replays events to NATS JetStream for downstream consumers —
+  elected by an flock so exactly one process runs it, even when agent-bus is loaded as a module
+  by several concurrent MCP clients
 - A reconciler catches artifacts (build plans, audit requests, handoffs) that were created without a corresponding log event
 
 ## Optional Components
@@ -54,6 +56,17 @@ graph TB
     NATS --> Downstream["Grafana · Helm Dashboard\ndownstream agents"]
 ```
 
+## Modules
+
+| Module | Role |
+|--------|------|
+| `server.py` | FastMCP server — the 5 tools above, plus the `federation_loop` background task |
+| `event_log.py` | The single append path shared by every writer: `fcntl.flock` + `prev_hash` chaining + fsync |
+| `event_vocab.py` | The single definition of the event vocabulary — server and client both import it, so they can't drift |
+| `nats_publisher.py` | Persistent NATS connection on a background thread |
+| `agent_bus_client.py` | Direct JSONL writer for non-MCP callers (see [Non-MCP Callers](#non-mcp-callers)) |
+| `reconcile.py` | Scans the artifacts directory for files with no logged event |
+
 ## Installation
 
 ```bash
@@ -93,13 +106,21 @@ Configure as an MCP server in your Claude Desktop or Claude Code settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AGENT_BUS_COMMS_DIR` | `~/.claude/comms` | Base directory for logs, artifacts, and cursors |
+| `AGENT_BUS_COMMS_DIR` | `~/.claude/comms` | Base directory for logs, artifacts, cursors, and the key registry |
 | `NATS_URL` | `nats://localhost:4222` | NATS server URL (optional) |
+| `NATS_AGENT_BUS_USER` | `agent-bus` | NATS username for federation publishing |
+| `NATS_AGENT_BUS_PASSWORD` | — | NATS password. Unset disables publishing entirely (no crash — the JSONL write stays authoritative) |
 | `NTFY_URL` | — | ntfy topic URL for push notifications (optional) |
 | `AGENT_BUS_CROSS_AGENT_RETENTION_DAYS` | `90` | Days to retain cross-agent log files |
 | `AGENT_BUS_SESSION_RETENTION_DAYS` | `30` | Days to retain session log files |
 | `AGENT_BUS_WEBHOOK_URL` | — | URL to POST event JSON to (optional) |
 | `AGENT_BUS_WEBHOOK_EVENTS` | — | Comma-separated event types to fire on, or `*` for all (optional) |
+| `AGENT_BUS_VERIFY_SIGNATURES` | `warn` | `warn` (log and accept) or `enforce` (reject unsigned events and events from unregistered sources) — see [Signing & Verification](#signing--verification) |
+| `AGENT_BUS_SIG_MAX_AGE` | `300` | Freshness window, in seconds, for `sig_v: 2` signatures |
+| `AGENT_BUS_FEDERATION` | `1` | Set `0` to disable the federation loop entirely |
+| `AGENT_BUS_FEDERATION_INTERVAL` | `30` | Seconds between federation cycles |
+| `AGENT_BUS_FEDERATION_MAX_EVENTS` | `500` | Cap on events published per federation cycle |
+| `AGENT_BUS_FEDERATION_MAX_SECONDS` | `10` | Wall-clock cap per federation cycle |
 
 Copy `.env.example` to `.env` and fill in the values you need. Blank values use the defaults shown above.
 
@@ -144,7 +165,44 @@ Retrieve a single event by UUID.
 
 Returns the current server configuration and health: configured paths, which optional
 integrations are active (NATS, ntfy, webhook), date range of available logs, and
-event count for today. Use this to verify setup after installation.
+event count for today. Use this to verify setup after installation. Integration URLs (NATS,
+ntfy, webhook) have any embedded userinfo (`user:pass@`) stripped before being returned.
+
+### `verify_chain`
+
+Walks a JSONL log file and checks the SHA-256 hash chain for tampering or deletion. Returns
+`{total_events, verified, chain_breaks, sig_failures, unsigned_events}`. Useful for
+post-incident integrity checks — chain breaks indicate a line was inserted, removed, or edited
+outside `log_event`/the client writers.
+
+## Signing & Verification
+
+Events can be signed with ed25519 and verified against a per-source key registry at
+`$AGENT_BUS_COMMS_DIR/agent-keys.json`. `AGENT_BUS_VERIFY_SIGNATURES` controls what happens on a
+signature problem:
+
+- **`warn`** (default) — logs and accepts unsigned events and events from sources absent from
+  the registry.
+- **`enforce`** — rejects unsigned events and events claiming a source that isn't registered. A
+  cryptographically invalid signature is rejected in *both* modes.
+
+**What replay protection actually guarantees.** A captured, validly-signed event replayed
+verbatim is not caught by the signature check alone — signing proves authorship, not freshness.
+Signers declaring `sig_v: 2` include `sig_ts` and `sig_nonce` inside `metadata`, which is part of
+the signed payload (see below), so neither can be forged or stripped without invalidating the
+signature. The nonce cache that catches an exact replay is **per process**, and agent-bus
+typically runs as one long-lived service plus one stdio child per MCP client — an event replayed
+to a *different* process than the one that first saw it will not be caught by the nonce check.
+The guarantee that holds across every process is the cryptographic freshness window: **a valid
+signature, seen at most once per process, and at most ±`AGENT_BUS_SIG_MAX_AGE` seconds old** (the
+window is symmetric to tolerate clock skew between agents). Size `AGENT_BUS_SIG_MAX_AGE` to the
+replay exposure you're willing to accept, not to the nonce cache. Signers that predate `sig_v: 2`
+are accepted but cannot be replay-checked.
+
+Note that `ts`, `id`, `hostname`, and `prev_hash` are assigned by the server *after* the client
+signs an event, so they cannot themselves be part of the signed payload — a client that wants
+them covered signs `sig_ts`/`sig_nonce` in `metadata` instead, which the server does include in
+what gets verified.
 
 ## Event Vocabulary
 
@@ -219,7 +277,20 @@ Events are published to `agent-bus.{hostname}.events` on the local NATS server. 
 - 2-minute dedup window (covers inline + federation-loop double-publish)
 - Storage: file
 
-The federation loop re-publishes from the file cursor every 30 seconds to fill gaps from NATS downtime. Consumers should treat the stream as **at-least-once**.
+Publishing itself is handled by a single persistent NATS connection held on a background thread
+(`nats_publisher.py`) — `log_event` enqueues onto a bounded queue and returns immediately; it
+never blocks and never raises, so a NATS outage cannot affect the JSONL write, which stays
+authoritative.
+
+The federation loop re-publishes from a per-file offset cursor (`federation-cursor.json`, format
+version 2) every `AGENT_BUS_FEDERATION_INTERVAL` seconds (default 30) to fill gaps from NATS
+downtime, skipping any file whose recorded offset already equals its size. It runs in exactly one
+process at a time — every process that loads agent-bus takes a non-blocking exclusive lock on a
+`.federation.lock` file; the lock holder federates and the rest retry, so it fails over without
+configuration. Each cycle is bounded by `AGENT_BUS_FEDERATION_MAX_EVENTS` and
+`AGENT_BUS_FEDERATION_MAX_SECONDS` so a cursor reset degrades to slower catch-up rather than one
+long blocking cycle. Set `AGENT_BUS_FEDERATION=0` to disable the loop entirely. Consumers should
+treat the stream as **at-least-once**.
 
 ## Non-MCP Callers
 
@@ -242,5 +313,8 @@ The client writes directly to the JSONL files using the same schema as the serve
 
 - Python 3.11+
 - `fastmcp>=3.2.4`
-- NATS CLI on PATH (optional, for federation)
-- `curl` on PATH (optional, for ntfy notifications and webhooks)
+- `cryptography` — ed25519 signature verification
+- `nats-py` — NATS federation publishing (optional at runtime: publishing is skipped if
+  `NATS_AGENT_BUS_PASSWORD` is unset, but the package is a real install-time dependency)
+- `curl` on PATH (optional, for ntfy notifications and webhooks — these shell out rather than
+  using an HTTP client library)
