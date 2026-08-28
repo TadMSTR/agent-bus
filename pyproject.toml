@@ -1,15 +1,33 @@
 [project]
 name = "agent-bus"
-version = "0.3.0"
+version = "0.3.1"
 description = "Inter-agent event bus with hash-chained JSONL logs and NATS federation"
 requires-python = ">=3.10"
-dependencies = [
+# EMPTY ON PURPOSE. The client path — agent_bus_client -> event_log -> event_vocab — is
+# stdlib-only, and it is the path non-MCP callers install (see the `client` extra below).
+# Hard-requiring the server's three dependencies made `pip install agent-bus` pull fastmcp,
+# cryptography and nats-py into callers that import none of them; task-dispatcher's cron
+# tick is the case that motivated this. The server's deps are in `[server]`.
+dependencies = []
+
+[project.optional-dependencies]
+# THE LIVE SERVER DOES NOT INSTALL FROM HERE. requirements.txt is the PM2 service's real
+# contract: ecosystem.config.js runs server.py from this source tree with venv/bin/python3,
+# and agent-bus is not installed as a distribution in its own venv at all. This extra
+# mirrors requirements.txt for anyone who does `pip install agent-bus[server]` — the two
+# files are intentionally separate and MUST be kept in step by hand. If the deploy is ever
+# switched to `pip install .`, delete requirements.txt in the same change rather than
+# leaving two contracts; an undocumented divergence here is how someone ends up with a
+# server that has no dependencies.
+server = [
     "fastmcp>=3.2.4,<4",
     "cryptography>=41.0",
     "nats-py>=2.6",
 ]
-
-[project.optional-dependencies]
+# Named for symmetry and for callers to depend on explicitly. It is empty because the
+# client genuinely needs nothing; tests/test_client_is_dependency_free.py is what keeps
+# that true.
+client = []
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.1",
