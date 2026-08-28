@@ -24,8 +24,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # dev AND server. v0.3.1 emptied [project] dependencies and moved fastmcp,
+      # cryptography and nats-py into the `server` extra; conftest.py imports `server`
+      # at module scope, so the whole suite needs them. `.[dev]` alone collects nothing.
       - name: Install
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,server]"
 
       - name: Lint
         run: ruff check .
@@ -58,9 +61,23 @@ jobs:
       # build-backend was an invalid string from May until 2026-08-19 and nothing
       # caught it, because CI only ever installed requirements.txt. This step is that
       # gap closed: it fails if the package cannot be built and imported.
-      - name: Install the built wheel and import every module
+      #
+      # SPLIT IN TWO SINCE v0.3.1, and the bare-wheel half is load-bearing. It installs
+      # the artifact with NO extras and imports only the client path, so it fails if a
+      # server dependency ever creeps back into [project] dependencies — or if the
+      # client starts needing one. tests/test_client_is_dependency_free.py checks the
+      # import graph; this checks the packaging metadata. Neither catches the other's
+      # failure: that test passes with fastmcp wrongly declared as a hard dep, and this
+      # step passes if a new import lands on something installed for another reason.
+      - name: Install the bare wheel — the client path must need no extras
         run: |
           pip install dist/*.whl
+          python -c "import agent_bus_client, event_log, event_vocab"
+          python -c "import importlib.util as u, sys; p=[m for m in ('fastmcp','cryptography','nats') if u.find_spec(m)]; sys.exit('bare wheel pulled in server deps: '+repr(p)) if p else None"
+
+      - name: Install the server extra and import every module
+        run: |
+          pip install "$(ls dist/*.whl)[server]"
           python -c "import server, reconcile, agent_bus_client, event_log, event_vocab, nats_publisher"
 
   audit:

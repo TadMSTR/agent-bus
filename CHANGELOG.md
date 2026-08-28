@@ -4,6 +4,68 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-08-28
+
+Makes the client installable without the server. Tracked as vikunja#550; shipped so
+`task-dispatcher` can declare a working dependency on this package.
+
+### Fixed
+
+- **`pip install agent-bus` no longer drags in `fastmcp`, `cryptography` and `nats-py`.**
+  `[project] dependencies` hard-required all three. The client path — `agent_bus_client`
+  → `event_log` → `event_vocab` — imports none of them and is stdlib-only, but any caller
+  that wanted `log_event()` had to install a web framework, an X.509 stack and a message
+  broker client to append a line to a JSONL file. The three moved to a new `server`
+  optional extra; `dependencies` is now empty.
+
+  This is what blocked the real fix downstream. `task-dispatcher` wraps its client import
+  in `except ImportError` and degrades to a no-op logger, so the cost was not an install
+  failure anyone would notice — it was five event types silently missing from the signed
+  audit trail while the dispatcher reported clean runs.
+
+### Added
+
+- `tests/test_client_is_dependency_free.py` — imports `agent_bus_client` and logs two
+  chained events in a child process where `fastmcp`, `cryptography` and `nats` are made
+  unimportable by a meta-path finder. It tests the *import graph*, not the environment:
+  the dev environment installs the server extra, so a check for "is fastmcp installed"
+  would be vacuous here and would go green right up until a caller's machine broke. A
+  second test asserts the blocker itself still fires, because a finder that quietly
+  stopped matching produces exactly the same green as a clean graph.
+- CI `build` job installs the bare wheel with **no extras** and imports only the client
+  modules. That covers the case the test above cannot: a server dependency reappearing
+  in `[project] dependencies`. Conversely the test covers what the job cannot — a new
+  import of something that happens to be installed for an unrelated reason. Both are
+  needed; neither is redundant.
+- `client` extra, empty by design, so callers can depend on the client path by name.
+- `task.workflow_started` added to `CROSS_AGENT_EVENTS`. task-dispatcher has emitted it
+  from its Temporal branch since v0.9.x and it was never in the set. It still reached the
+  cross-agent log — but only because every caller leaves `scope` at its `"cross-agent"`
+  default and `resolve_scope` returns that default for unknown types. The routing was
+  incidental rather than declared, and one caller passing an explicit scope would have
+  diverted it into the session file silently. **No behaviour change today**; this makes the
+  existing behaviour intentional. Found by the call-site parity check in task-dispatcher's
+  new emitter test, which also established that the dispatcher emits *six* event types, not
+  the five that vikunja#550 and the build plan both counted.
+
+### Changed
+
+- CI `test` job installs `.[dev,server]`. `conftest.py` imports `server` at module scope,
+  so `.[dev]` alone now collects nothing.
+- `pyproject.toml` records, in a comment, that `requirements.txt` is the live PM2
+  service's install contract and `[server]` only mirrors it. The two files were already
+  separate; this release widens the gap, and an undocumented divergence is how a later
+  switch to `pip install .` produces a server with no dependencies.
+
+### Not changed, deliberately
+
+- **`requirements.txt`.** The PM2 service runs `server.py` from this source tree
+  (`ecosystem.config.js`: `script: server.py`, `interpreter: venv/bin/python3`) and
+  `agent-bus` is not installed as a distribution in its own venv at all, so
+  `[project] dependencies` is not its contract and emptying it cannot affect the running
+  process. Verified at the runtime layer before this change shipped; an earlier draft of
+  the plan wrongly called for a coordinated redeploy.
+
 ## [0.3.0] — 2026-08-19
 
 Hardening pass plus the repo-standard backfill. Tracked as vikunja#433; also closes

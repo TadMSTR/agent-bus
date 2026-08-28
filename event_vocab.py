@@ -19,6 +19,15 @@ CROSS_AGENT_EVENTS = frozenset(
         "task.completed",
         "task.failed",
         "task.routing-failed",
+        # Emitted by task-dispatcher's Temporal branch since v0.9.x and absent from this
+        # set until now. It still reached the cross-agent log, but only because every
+        # caller happens to leave `scope` at its "cross-agent" default and resolve_scope
+        # returns that default for unknown types — the routing was incidental, not
+        # declared. One caller passing an explicit scope would have diverted it silently.
+        # (Underscore rather than the hyphen the rest of task.* uses; renaming it would
+        # break consumers querying by event type and 3 months of records already on disk,
+        # so it needs a migration rather than a drive-by rename — vikunja#553.)
+        "task.workflow_started",
         "handoff.created",
         "handoff.picked-up",
         "handoff.completed",
