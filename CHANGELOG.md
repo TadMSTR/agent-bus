@@ -38,6 +38,15 @@ Makes the client installable without the server. Tracked as vikunja#550; shipped
   import of something that happens to be installed for an unrelated reason. Both are
   needed; neither is redundant.
 - `client` extra, empty by design, so callers can depend on the client path by name.
+- `task.workflow_started` added to `CROSS_AGENT_EVENTS`. task-dispatcher has emitted it
+  from its Temporal branch since v0.9.x and it was never in the set. It still reached the
+  cross-agent log — but only because every caller leaves `scope` at its `"cross-agent"`
+  default and `resolve_scope` returns that default for unknown types. The routing was
+  incidental rather than declared, and one caller passing an explicit scope would have
+  diverted it into the session file silently. **No behaviour change today**; this makes the
+  existing behaviour intentional. Found by the call-site parity check in task-dispatcher's
+  new emitter test, which also established that the dispatcher emits *six* event types, not
+  the five that vikunja#550 and the build plan both counted.
 
 ### Changed
 
