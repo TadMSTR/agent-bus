@@ -58,8 +58,22 @@ class VocabularyError(ValueError):
     is an exception: a caller that ignored a sentinel return would carry on believing
     it had logged something.
 
-    Callers that must not fail on a bus problem should catch it — task-dispatcher's
-    `bus_log` is already wrapped for exactly this reason.
+    CALLERS ARE NOT ALL WRAPPED, so read this before enabling `enforce`. An earlier
+    version of this docstring asserted that task-dispatcher's `bus_log` catches it. That
+    was wrong and was corrected on inspection: task-dispatcher wraps only the IMPORT in
+    `except ImportError`, and its seven call sites are bare. Under `enforce`, an
+    undeclared type raised from here would propagate into a dispatcher tick.
+
+    That is not a gap left open — it is closed on the emitter side, which is the better
+    place. `task-dispatcher/tests/test_bus_vocabulary.py` parses every event type the
+    dispatcher emits and fails CI if any is undeclared here, so the exception cannot be
+    reached by that caller. A blanket try/except at the call sites would be worse: it is
+    the same silent-degradation shape as the stale-client bug this module exists to
+    prevent (vikunja#550), and `test_bus_emitter_live.py` identifies the real client from
+    the no-op stub BY `__module__`, so a local wrapper would read as the stub.
+
+    A caller with no such gate and no tolerance for a raise should catch VocabularyError
+    itself.
     """
 
 
