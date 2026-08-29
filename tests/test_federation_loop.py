@@ -66,6 +66,44 @@ def test_loop_does_not_federate_while_nats_is_down(comms_dir, publisher, monkeyp
     assert not ab.CURSOR_FILE.exists()
 
 
+def test_loop_does_not_federate_when_connected_but_no_stream_matches(
+    comms_dir, publisher, monkeypatch
+):
+    """The three-month failure, as an assertion (vikunja#561).
+
+    NATS was up and answering the whole time; there was simply no stream capturing
+    `events.agent-bus.<host>`, so every core publish succeeded and every message was
+    discarded. If the loop gates on `connected` it federates happily through that and
+    advances the cursor, marking as delivered events that no longer exist anywhere but
+    the JSONL — an outage that would have been recoverable becomes permanent loss.
+
+    Gating on `deliverable` is what makes the backlog wait for a stream instead.
+    """
+    _fast(monkeypatch)
+    _seed(comms_dir, 3)
+    publisher.stream = None  # connected, but nothing is retaining our subject
+
+    _run_briefly(ab.federation_loop)
+
+    assert publisher.published == []
+    assert not ab.CURSOR_FILE.exists()
+
+
+def test_loop_federates_once_the_stream_appears(comms_dir, publisher, monkeypatch):
+    """Phase 5.0 had sysadmin create the stream under a running agent-bus."""
+    _fast(monkeypatch)
+    _seed(comms_dir, 3)
+    publisher.stream = None
+
+    _run_briefly(ab.federation_loop)
+    assert publisher.published == []
+
+    publisher.stream = "AGENT_BUS"
+    _run_briefly(ab.federation_loop)
+
+    assert len(publisher.published) == 3
+
+
 def test_loop_resumes_after_nats_comes_back(comms_dir, publisher, monkeypatch):
     _fast(monkeypatch)
     _seed(comms_dir, 3)

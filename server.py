@@ -21,12 +21,18 @@ from fastmcp import FastMCP
 import event_log
 from event_log import append_event as _append_event
 from event_log import sha256 as _sha256
-from event_vocab import CROSS_AGENT_EVENTS, HIGH_PRIORITY_EVENTS, resolve_scope
+from event_vocab import (
+    CROSS_AGENT_EVENTS,
+    HIGH_PRIORITY_EVENTS,
+    SESSION_EVENTS,
+    resolve_scope,
+    unknown_event_reason,
+)
 from nats_publisher import NatsPublisher
 
 # Re-exported: the vocabulary is documented as part of this module's surface, and
 # external callers import it from here. event_vocab is the single definition.
-__all__ = ["CROSS_AGENT_EVENTS", "HIGH_PRIORITY_EVENTS", "resolve_scope"]
+__all__ = ["CROSS_AGENT_EVENTS", "HIGH_PRIORITY_EVENTS", "SESSION_EVENTS", "resolve_scope"]
 
 _log = logging.getLogger("agent-bus")
 
@@ -131,6 +137,16 @@ _strip_qs = _strip_credentials
 
 KEY_REGISTRY_PATH = COMMS_DIR / "agent-keys.json"
 VERIFY_SIGNATURES: str = os.environ.get("AGENT_BUS_VERIFY_SIGNATURES", "warn")
+
+# `off` | `warn` | `enforce`, default `warn` — deliberately the same shape and default
+# as VERIFY_SIGNATURES above, so the two policy knobs read alike. Held here as a module
+# global (rather than read from event_vocab on each call) for exactly the reason
+# VERIFY_SIGNATURES is: tests monkeypatch the module attribute, and a function reading
+# the environment at call time cannot be steered that way.
+#
+# ecosystem.config.js passes every configured variable through, so an unset one arrives
+# as an empty string rather than absent — hence `or`, not a dict default.
+STRICT_VOCAB: str = os.environ.get("AGENT_BUS_STRICT_VOCAB") or "warn"
 
 # Replay window for signature version 2+. See _check_replay.
 SIG_MAX_AGE_SECONDS = _env_num("AGENT_BUS_SIG_MAX_AGE", 300, int)
@@ -426,6 +442,22 @@ def log_event(
     }
     scope_resolved = resolve_scope(event_type, scope)
 
+    # Vocabulary gate. Note the ORDER: resolve_scope has already corrected the routing
+    # of an unknown type to cross-agent above, so `warn` accepts the event AND files it
+    # where it can be seen. Warning about a divert while still diverting would fix
+    # nothing — the silent divert is the defect, not the silence.
+    vocab_reason = unknown_event_reason(event_type, STRICT_VOCAB)
+    if vocab_reason:
+        if STRICT_VOCAB == "enforce":
+            return {"id": event["id"], "logged": False, "error": vocab_reason}
+        _log.warning(
+            "vocabulary_policy source=%s event_type=%s id=%s reason=%s",
+            source,
+            event_type,
+            event["id"],
+            vocab_reason,
+        )
+
     if VERIFY_SIGNATURES in ("warn", "enforce"):
         accepted, reason = _check_signature(event)
         if not accepted:
@@ -628,6 +660,11 @@ def get_status() -> dict:
             "registered_agents": list(key_registry.keys()),
             "verify_mode": VERIFY_SIGNATURES,
             "replay_protection": f"signatures declaring sig_v>=2 (window {SIG_MAX_AGE_SECONDS}s)",
+        },
+        "vocabulary": {
+            "strict_mode": STRICT_VOCAB,
+            "cross_agent_types": len(CROSS_AGENT_EVENTS),
+            "session_types": len(SESSION_EVENTS),
         },
         "integrations": {
             "nats": {
@@ -835,9 +872,14 @@ async def federation_loop() -> None:
                 continue
 
             _publisher.start()
-            if not _publisher.connected:
+            if not _publisher.deliverable:
                 # Anything published now would be dropped. Leave the cursor untouched
                 # so the gap is replayed once NATS is reachable again.
+                #
+                # `deliverable`, NOT `connected`: connected-but-no-matching-stream is a
+                # state this server was in for three months, and in it every publish
+                # succeeds and every message is discarded. Advancing the cursor across
+                # that would mark the events delivered and never replay them.
                 await asyncio.sleep(FEDERATION_INTERVAL)
                 continue
 

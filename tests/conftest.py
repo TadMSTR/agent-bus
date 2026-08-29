@@ -18,11 +18,15 @@ class StubPublisher:
     lets individual tests choose to refuse, disconnect, or raise.
     """
 
-    def __init__(self, enabled=True, connected=True, accept=True, raises=False):
+    def __init__(self, enabled=True, connected=True, accept=True, raises=False, stream="AGENT_BUS"):
         self._enabled = enabled
         self._connected = connected
         self.accept = accept
         self.raises = raises
+        # Separate from `connected` on purpose: connected-with-no-stream is a real and
+        # previously invisible state (vikunja#561), so the stub has to be able to
+        # represent it or no test can cover the federation loop's gate on it.
+        self.stream = stream
         self.published: list[dict] = []
 
     @property
@@ -32,6 +36,14 @@ class StubPublisher:
     @property
     def connected(self):
         return self._connected
+
+    @property
+    def stream_name(self):
+        return self.stream
+
+    @property
+    def deliverable(self):
+        return self._connected and self.stream is not None
 
     def publish(self, event):
         if self.raises:
@@ -48,7 +60,12 @@ class StubPublisher:
         pass
 
     def stats(self):
-        return {"enabled": self._enabled, "connected": self._connected}
+        return {
+            "enabled": self._enabled,
+            "connected": self._connected,
+            "stream": self.stream,
+            "deliverable": self.deliverable,
+        }
 
 
 @pytest.fixture
