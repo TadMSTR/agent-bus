@@ -1,6 +1,6 @@
 [project]
 name = "agent-bus"
-version = "0.3.1"
+version = "0.4.0"
 description = "Inter-agent event bus with hash-chained JSONL logs and NATS federation"
 requires-python = ">=3.10"
 # EMPTY ON PURPOSE. The client path — agent_bus_client -> event_log -> event_vocab — is

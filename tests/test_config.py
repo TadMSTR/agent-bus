@@ -86,6 +86,24 @@ def test_defaults_are_used_when_every_var_is_empty():
     assert values == "(500, 10.0, 300)"
 
 
+def test_strict_vocab_falls_back_to_warn_when_empty():
+    """The PM2 case, for the policy variable added in Phase 5.1.
+
+    ecosystem.config.js passes AGENT_BUS_STRICT_VOCAB through unconditionally, so an
+    operator who has not set it in .env sends an empty string. `os.environ.get(name,
+    "warn")` would hand back `""` — which matches neither "warn" nor "enforce" and
+    would leave the gate in a fourth, undefined state.
+    """
+    assert _import_server_with({"AGENT_BUS_STRICT_VOCAB": ""}, "server.STRICT_VOCAB") == "warn"
+
+
+def test_strict_vocab_is_read_from_the_environment():
+    assert (
+        _import_server_with({"AGENT_BUS_STRICT_VOCAB": "enforce"}, "server.STRICT_VOCAB")
+        == "enforce"
+    )
+
+
 def test_federation_stays_enabled_when_the_flag_is_empty():
     assert _import_server_with({"AGENT_BUS_FEDERATION": ""}, "server.FEDERATION_ENABLED") == "True"
 

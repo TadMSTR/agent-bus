@@ -4,6 +4,88 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-08-29
+
+Two failures of the same kind: a thing that was configured, reported healthy, and was
+not happening. Build plan `agent-workflow-interop-2026-08`, Phase 5.1 and 5.0 d;
+vikunja#560 and #561.
+
+### Fixed
+
+- **An unknown `event_type` is no longer silently diverted (vikunja#560).** `log_event`
+  never validated the type. An unrecognised one kept the caller's `scope` argument and
+  landed wherever that pointed, so `task.workflow_started` reached the cross-agent log
+  for months purely because every caller happened to leave `scope` at its default — one
+  caller passing `scope="session"` would have filed it where no
+  `query_events(scope="cross-agent")` and no federation would ever look again.
+
+  `resolve_scope` now sends an **undeclared** type to the cross-agent log regardless of
+  what the caller asked for. Unknown means "nobody has decided where this belongs", and
+  the answer to that is the visible file.
+
+- **NATS publishing goes through JetStream, so a missing stream is an error
+  (vikunja#561).** The publisher used core `nc.publish()`. A core publish to a subject
+  no stream matches *succeeds* and the message is discarded — and the next line
+  incremented `published`. Measured on forge 2026-08-28: the server had **zero streams**
+  while every counter in `get_status` reported months of clean publishes. agent-bus had
+  been federating into a void and no health surface could say so.
+
+  `js.publish()` waits for a PubAck and raises when none comes, so `published` now
+  counts events **accepted by a stream**. There is deliberately no fallback to core
+  publish; a fallback would restore the silent discard together with the false success.
+
+- **The README named a subject the code does not publish to (vikunja#562).** It said
+  events go to `agent-bus.{hostname}.events` and that the stream should capture
+  `agent-bus.>`. The code has always used `events.agent-bus.{hostname}`, and `nats.conf`
+  grants this user `publish: ["events.>"]` — so the documented subject was not merely
+  unmatched, it was unauthorised. A stream built from those instructions would have
+  existed, reported a healthy `jsz` count, and retained nothing.
+
+- **The federation loop gates on `deliverable`, not `connected`.** Connected-with-no-
+  stream is the state the server was actually in; advancing the cursor through it marks
+  discarded events as delivered and makes a recoverable outage permanent.
+
+### Added
+
+- **`AGENT_BUS_STRICT_VOCAB`** — `off` | `warn` | `enforce`, default `warn`. Mirrors
+  `AGENT_BUS_VERIFY_SIGNATURES` in shape and default. `warn` logs and accepts; `enforce`
+  rejects (the MCP tool returns `{"logged": false, "error": …}`, the Python client raises
+  the new `VocabularyError`). An unrecognised value is treated as `warn`, never as `off`
+  — a typo in a policy variable must not silently disable the policy.
+
+  **Both writers are gated.** The check lives in `event_vocab.py` and runs in `server.py`
+  *and* `agent_bus_client.py`. task-dispatcher — the emitter whose undeclared
+  `task.workflow_started` is the worked example above — writes through the client, so a
+  gate only in the MCP server would have left exactly the caller it was built for
+  ungated.
+
+- **`SESSION_EVENTS`**, a declared session vocabulary: `tool.called`, `workspace.drift`,
+  `workspace.healed`. Without it, "unknown routes cross-agent" would redirect the 17,145
+  `tool.called` events in the live session corpus into the cross-agent log — fixing a
+  silent divert by adding a loud one.
+
+- **Seven event types declared** after reconciling the sets against the live corpus:
+  `tracker.ticket.created`, `config.proposal.countersign_requested`,
+  `config.proposal.countersigned`, `agent-workflow.changed`, `update.cycle.completed`,
+  `compact_qc.complete`, `rollover_qc.complete`. Each has an emitter that names the
+  string. Roughly forty further types in the corpus were left **undeclared on purpose**,
+  because several are drift rather than vocabulary (`build.complete` beside
+  `build.completed`, `plane.ticket.*` from a tracker retired in July). Declaring a typo
+  turns this gate into a rubber stamp. This is also why **`enforce` is not yet reachable
+  on forge** and `warn` ships as the default.
+
+- `get_status` reports `vocabulary.strict_mode` and the size of each set, and the NATS
+  publisher's stats gained `subject`, `stream`, `stream_error` and `deliverable`. A
+  `published` count above zero next to a null `stream` is the exact contradiction a bare
+  counter could not express.
+
+- The stream is resolved from the server **by subject**, not by name, and re-resolved
+  while running. A name lookup would have reported healthy against a stream matching
+  nothing this server sends — the #562 bug wearing a health check. Re-resolution is what
+  lets a stream created out of band (as sysadmin did in Phase 5.0) start working without
+  an agent-bus restart.
+
+
 ## [0.3.1] — 2026-08-28
 
 Makes the client installable without the server. Tracked as vikunja#550; shipped so

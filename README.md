@@ -40,7 +40,7 @@ graph TB
     PyClient -->|"direct JSONL write"| Logs
 
     Server --> Logs["JSONL logs\n$AGENT_BUS_COMMS_DIR/logs/"]
-    Server -->|"inline publish"| NATS["NATS JetStream\nevents.agent-bus.host"]
+    Server -->|"inline JetStream publish (PubAck)"| NATS["NATS JetStream\nevents.agent-bus.host"]
     Server -->|"high-priority events"| Ntfy["ntfy alert"]
     Server -->|"WEBHOOK_EVENTS filter"| Webhook["HTTP webhook"]
 
@@ -117,6 +117,7 @@ Configure as an MCP server in your Claude Desktop or Claude Code settings:
 | `AGENT_BUS_WEBHOOK_EVENTS` | — | Comma-separated event types to fire on, or `*` for all (optional) |
 | `AGENT_BUS_VERIFY_SIGNATURES` | `warn` | `warn` (log and accept) or `enforce` (reject unsigned events and events from unregistered sources) — see [Signing & Verification](#signing--verification) |
 | `AGENT_BUS_SIG_MAX_AGE` | `300` | Freshness window, in seconds, for `sig_v: 2` signatures |
+| `AGENT_BUS_STRICT_VOCAB` | `warn` | `off`, `warn` (log and accept) or `enforce` (reject) for an event type in neither vocabulary — see [Event Vocabulary](#event-vocabulary) |
 | `AGENT_BUS_FEDERATION` | `1` | Set `0` to disable the federation loop entirely |
 | `AGENT_BUS_FEDERATION_INTERVAL` | `30` | Seconds between federation cycles |
 | `AGENT_BUS_FEDERATION_MAX_EVENTS` | `500` | Cap on events published per federation cycle |
@@ -231,10 +232,60 @@ Events that automatically route to `cross-agent` scope regardless of the `scope`
 | `deploy.started` | Deployment begun |
 | `deploy.completed` | Deployment finished |
 | `security.finding` | Security agent logged a finding |
+| `tracker.ticket.created` | Vikunja ticket filed by an agent |
+| `config.proposal.countersign_requested` | steward asked security to countersign a config change |
+| `config.proposal.countersigned` | security recorded a countersign verdict |
+| `agent-workflow.changed` | An agent's manifest or workflow was changed |
+| `update.cycle.completed` | Scheduled update cycle finished |
+| `compact_qc.complete` | Memory-compaction QC run finished |
+| `rollover_qc.complete` | Memory-rollover QC run finished |
 
 High-priority events that also trigger a push notification: `audit.requested`, `task.failed`, `task.routing-failed`, `handoff.created`.
 
-For session-scoped events (memory flushes, skill executions, etc.), use `scope="session"` — these go to a separate daily log file and are not federated to NATS.
+### Session-scoped events
+
+| Event | Emitter |
+|-------|---------|
+| `tool.called` | scoped-mcp's audit trail (writes the session JSONL directly) |
+| `workspace.drift` | `agent-workspace-scan.py` |
+| `workspace.healed` | `agent-workspace-scan.py` |
+
+These go to a separate daily log file and are not federated to NATS. Pass `scope="session"`.
+
+### An undeclared event type routes cross-agent, and is reported
+
+An event type in neither table is **not** filed wherever the caller asked. It goes to the
+**cross-agent** log regardless, because "nobody has decided where this belongs" is not a reason
+to put it in the quiet file.
+
+This is the vikunja#560 fix. `log_event` never validated `event_type`, so an unknown type kept
+the caller's `scope`. `task.workflow_started` reached the cross-agent log for months purely
+because every caller happened to leave `scope` at its default — one caller passing
+`scope="session"` would have diverted it somewhere no `query_events(scope="cross-agent")` and no
+federation would ever look again.
+
+`AGENT_BUS_STRICT_VOCAB` controls what is *reported* on top of that routing:
+
+| Mode | Behaviour |
+|------|-----------|
+| `off` | No report. The routing fix still applies — the divert was the bug, not the silence. |
+| `warn` (default) | Logs `vocabulary_policy …` and accepts the event. |
+| `enforce` | Rejects it: the MCP tool returns `{"logged": false, "error": …}`; the Python client raises `VocabularyError`. |
+
+An unrecognised value is treated as `warn`, not as `off` — a typo in a policy variable must not
+silently disable the policy.
+
+**`enforce` is not yet reachable on forge.** A reconciliation of the live corpus on 2026-08-29
+found roughly forty types still in active use that are not declared above, so `enforce` today
+would drop real events from real agents. Only types with a *sanctioned emitter* were added;
+apparent drift (`build.complete` beside `build.completed`, `plane.ticket.*` from a tracker
+retired in July) was deliberately left undeclared, because declaring a typo turns this gate into
+a rubber stamp. Watch what `warn` logs, fix the emitters, then flip.
+
+**Both writers are gated.** The check lives in `event_vocab.py` and runs in `server.py` *and*
+`agent_bus_client.py`. task-dispatcher — the emitter whose undeclared `task.workflow_started` is
+the worked example above — writes through the client, so a gate only in the MCP server would
+have left exactly the caller it was designed for ungated.
 
 ## Storage Layout
 
@@ -272,15 +323,46 @@ Each JSONL line is a complete event object:
 
 ## NATS Federation
 
-Events are published to `agent-bus.{hostname}.events` on the local NATS server. The AGENT_BUS JetStream stream should subscribe to `agent-bus.>` subjects with:
-- 30-day retention
+Events are published to **`events.agent-bus.{hostname}`** on the local NATS server, and the
+`AGENT_BUS` JetStream stream captures `events.agent-bus.>` with:
+- 30-day retention (`max_age`)
 - 2-minute dedup window (covers inline + federation-loop double-publish)
 - Storage: file
+
+> **This section used to name the wrong subject, and that mistake had consequences.** It said
+> events went to `agent-bus.{hostname}.events` and that the stream should capture `agent-bus.>`.
+> The code has always published to `events.agent-bus.{hostname}` (`server.py`), so a stream
+> built from the old text would have matched **nothing** — and, because `nats.conf` grants the
+> `agent-bus` user `publish: ["events.>"]`, the subject this file named was not merely unmatched
+> but unauthorised. A stream created from these instructions would have existed, reported a
+> healthy `jsz` count, and retained none of this server's events. Corrected 2026-08-29;
+> tracked as vikunja#562. **The code is authoritative, not this file.**
 
 Publishing itself is handled by a single persistent NATS connection held on a background thread
 (`nats_publisher.py`) — `log_event` enqueues onto a bounded queue and returns immediately; it
 never blocks and never raises, so a NATS outage cannot affect the JSONL write, which stays
 authoritative.
+
+### Publishing is via JetStream, so "no stream" is an error
+
+`nats_publisher.py` publishes with `js.publish()` and waits for a **PubAck**. This is not a
+detail: the previous core `nc.publish()` succeeded and discarded the message whenever no stream
+matched the subject, then incremented the success counter on the next line. On 2026-08-28 the
+server was measured with **zero streams** while every counter reported months of clean
+publishes — agent-bus had been federating into a void and no health surface could say so
+(vikunja#561).
+
+Consequences worth knowing:
+
+- `published` in `get_status` counts PubAcks, i.e. events **accepted by a stream**.
+- `stream` reports which stream is capturing the configured subject, resolved from the server
+  **by subject** — not by name, because a name lookup would have reported healthy against a
+  stream matching nothing this server sends. `null` means nothing is retaining these events.
+- The federation loop gates on `deliverable` (connected **and** a stream matches), not on
+  `connected`. Connected-with-no-stream is exactly the state that persisted for three months;
+  advancing the cursor through it would mark discarded events as delivered.
+- There is deliberately **no fallback to core publish**. A fallback would restore the silent
+  discard along with the false success.
 
 The federation loop re-publishes from a per-file offset cursor (`federation-cursor.json`, format
 version 2) every `AGENT_BUS_FEDERATION_INTERVAL` seconds (default 30) to fill gaps from NATS

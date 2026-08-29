@@ -28,9 +28,18 @@ def test_log_event_cross_agent_routes_to_cross_agent_file(comms_dir):
     assert len(files) == 1
 
 
-def test_log_event_unknown_scope_falls_back_to_session(comms_dir):
+def test_log_event_declared_session_type_honours_the_requested_scope(comms_dir):
+    """A DECLARED session type is the caller's to place — that is what declaring means.
+
+    Retargeted from a version of this test that used `memory.written`, an UNDECLARED
+    type, to assert the same thing. That behaviour is the vikunja#560 defect: an
+    unknown type inherited the caller's scope and could be filed away where no
+    cross-agent query and no federation would ever see it. The property being pinned —
+    "a session-scoped event lands in the session file" — is still real and still
+    covered; it just has to be asserted with a type the vocabulary actually declares.
+    """
     result = ab.log_event(
-        event_type="memory.written",
+        event_type="workspace.healed",
         source="dev",
         summary="s",
         scope="session",
@@ -38,6 +47,20 @@ def test_log_event_unknown_scope_falls_back_to_session(comms_dir):
     assert result["scope"] == "session"
     files = list((comms_dir / "logs").glob("*-session.jsonl"))
     assert len(files) == 1
+
+
+def test_log_event_undeclared_type_is_routed_cross_agent_not_to_session(comms_dir):
+    """The vikunja#560 fix: unknown means visible, never quietly filed."""
+    result = ab.log_event(
+        event_type="memory.written",
+        source="dev",
+        summary="s",
+        scope="session",
+    )
+    assert result["logged"] is True
+    assert result["scope"] == "cross-agent"
+    assert list((comms_dir / "logs").glob("*-cross-agent.jsonl"))
+    assert not list((comms_dir / "logs").glob("*-session.jsonl"))
 
 
 def test_log_event_hash_chain_links_events(comms_dir):

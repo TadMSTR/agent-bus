@@ -120,9 +120,15 @@ def test_stats_are_reported_for_get_status():
 
     assert stats["enabled"] is False
     assert stats["connected"] is False
+    assert stats["stream"] is None
+    assert stats["deliverable"] is False
     assert set(stats) == {
         "enabled",
         "connected",
+        "subject",
+        "stream",
+        "stream_error",
+        "deliverable",
         "published",
         "dropped",
         "publish_errors",
@@ -156,14 +162,48 @@ def test_get_status_includes_publisher_stats(comms_dir):
 # ── the connection itself, against a fake nats module ─────────────────────────
 
 
+class _FakeJetStream:
+    """The JetStream context, with the two calls the publisher makes.
+
+    ``stream`` is the name returned for a matching subject; None means the server has
+    no stream capturing it, which is the state forge was actually in for three months
+    (vikunja#561) and the one the publisher must now refuse to paper over.
+    """
+
+    def __init__(self, conn, stream="AGENT_BUS"):
+        self._conn = conn
+        self.stream = stream
+        self.lookups = 0
+
+    async def find_stream_name_by_subject(self, subject):
+        self.lookups += 1
+        if self.stream is None:
+            raise LookupError(f"no stream matches {subject}")
+        return self.stream
+
+    async def publish(self, subject, payload, timeout=None):
+        # Mirrors the real client: no stream, no PubAck, an exception — never a
+        # silent success. That asymmetry with core publish is the whole change.
+        if self.stream is None:
+            raise TimeoutError("no response from stream")
+        self._conn.published.append((subject, payload))
+        return object()  # stands in for the PubAck
+
+
 class _FakeConn:
-    def __init__(self):
+    def __init__(self, stream="AGENT_BUS"):
         self.published = []
         self.closed = False
         self.is_connected = True
+        self.js = _FakeJetStream(self, stream)
 
-    async def publish(self, subject, payload):
-        self.published.append((subject, payload))
+    def jetstream(self):
+        return self.js
+
+    async def publish(self, subject, payload):  # pragma: no cover — must not be called
+        raise AssertionError(
+            "core publish is what discarded three months of events — use JetStream"
+        )
 
     async def close(self):
         self.closed = True
@@ -172,10 +212,10 @@ class _FakeConn:
 class _FakeNats:
     """Stands in for the nats-py module inside the publisher thread."""
 
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, stream="AGENT_BUS"):
         self.fail = fail
         self.connect_kwargs = []
-        self.conn = _FakeConn()
+        self.conn = _FakeConn(stream)
 
     async def connect(self, **kwargs):
         self.connect_kwargs.append(kwargs)
@@ -234,6 +274,8 @@ def test_event_reaches_the_connection(monkeypatch):
         assert json.loads(payload.decode())["id"] == "abc"
         assert pub.published == 1
         assert pub.connected is True
+        assert pub.stream_name == "AGENT_BUS"
+        assert pub.deliverable is True
     finally:
         pub.close(timeout=2)
 
@@ -274,3 +316,97 @@ def test_close_shuts_the_connection_down(monkeypatch):
     pub.close(timeout=3)
 
     assert _wait_for(lambda: fake.conn.closed)
+
+
+# ── the missing stream must be detectable (vikunja#561, plan 5.0 d) ───────────
+#
+# The premise, measured on forge 2026-08-28: `GET :8222/jsz` reported `"streams": 0`
+# while this publisher's counters showed months of clean publishes. Core `nc.publish()`
+# to a subject no stream matches succeeds and the message is discarded, so `published`
+# incremented for every event that no longer existed. These are the assertions that
+# make that state impossible to report as healthy.
+
+
+def test_no_matching_stream_is_a_publish_failure_not_a_silent_success(monkeypatch):
+    """The regression test for three months of federating into a void."""
+    fake = _FakeNats(stream=None)
+    _install_fake_nats(monkeypatch, fake)
+    pub = _publisher()
+    try:
+        assert pub.publish({"id": "x"}) is True  # accepted onto the queue
+        assert _wait_for(lambda: pub.publish_errors >= 1), "publish never failed"
+
+        # The counter that used to lie. It must not move for a message no stream took.
+        assert pub.published == 0
+        assert pub.stream_name is None
+        assert pub.deliverable is False
+        assert fake.conn.published == []
+    finally:
+        pub.close(timeout=2)
+
+
+def test_stats_expose_the_contradiction_a_bare_counter_hid(monkeypatch):
+    """`published` alone cannot distinguish delivered from discarded; `stream` can."""
+    fake = _FakeNats(stream=None)
+    _install_fake_nats(monkeypatch, fake)
+    pub = _publisher()
+    try:
+        pub.publish({"id": "x"})
+        assert _wait_for(lambda: pub.publish_errors >= 1)
+
+        stats = pub.stats()
+        assert stats["connected"] is True  # the server is up and answering...
+        assert stats["stream"] is None  # ...and nothing is retaining our subject
+        assert stats["deliverable"] is False
+        assert stats["subject"] == "events.agent-bus.test"
+        assert "no stream matches" in stats["stream_error"]
+    finally:
+        pub.close(timeout=2)
+
+
+def test_the_lookup_is_by_subject_not_by_stream_name(monkeypatch):
+    """vikunja#562: the README named a subject the code never publishes to.
+
+    A check that confirmed "a stream called AGENT_BUS exists" would have passed against
+    a stream subscribed to `agent-bus.>` while this publisher sends to
+    `events.agent-bus.<host>` — recreating the exact bug it was added to catch. So the
+    resolution must go through the SUBJECT.
+    """
+    fake = _FakeNats()
+    _install_fake_nats(monkeypatch, fake)
+    pub = _publisher(subject="events.agent-bus.forge")
+    try:
+        # publish() is what starts the thread, so it comes before any wait on state
+        # the thread produces.
+        pub.publish({"id": "x"})
+        assert _wait_for(lambda: fake.conn.published), "event never published"
+        assert fake.conn.js.lookups >= 1, "the stream was never resolved by subject"
+        assert fake.conn.published[0][0] == "events.agent-bus.forge"
+    finally:
+        pub.close(timeout=2)
+
+
+def test_a_stream_created_while_running_is_picked_up_without_a_reconnect(monkeypatch):
+    """sysadmin creating the stream must not require an agent-bus restart.
+
+    Phase 5.0 had sysadmin create AGENT_BUS on a server this publisher was already
+    connected to. If the subject lookup only ran on connect, every event until the next
+    reconnect would still fail — and the operator would conclude the stream was wrong.
+    """
+    fake = _FakeNats(stream=None)
+    _install_fake_nats(monkeypatch, fake)
+    pub = _publisher()
+    try:
+        pub.publish({"id": "before"})
+        assert _wait_for(lambda: pub.publish_errors >= 1)
+        assert pub.deliverable is False
+
+        fake.conn.js.stream = "AGENT_BUS"  # sysadmin creates it, out of band
+
+        assert _wait_for(lambda: pub.deliverable, timeout=10), "stream never re-resolved"
+        pub.publish({"id": "after"})
+        assert _wait_for(lambda: fake.conn.published), "publishing never recovered"
+        assert json.loads(fake.conn.published[0][1].decode())["id"] == "after"
+        assert len(fake.connect_kwargs) == 1  # ...and it never reconnected
+    finally:
+        pub.close(timeout=2)
