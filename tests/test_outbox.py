@@ -473,3 +473,33 @@ def test_ts_is_normalised_to_utc_offset_form(tmp_path):
     d.drain_once()
     [e] = _logged(tmp_path / "logs")
     assert e["ts"] == "2026-10-16T22:00:00+00:00"
+
+
+@pytest.mark.parametrize("ts", ["2026-10-16T22:00:00Z", "2026-10-16T22:00:00.123456z"])
+def test_a_trailing_z_is_accepted_on_every_python(tmp_path, ts):
+    p = _put(tmp_path / "ob", body=lambda e: _body(e, ts=ts))
+    d, _ = _drainer(p.parent, tmp_path / "logs")
+    assert d.drain_once() == 1
+    [e] = _logged(tmp_path / "logs")
+    assert e["ts"].startswith("2026-10-16T22:00:00") and e["ts"].endswith("+00:00")
+
+
+def test_a_fifo_swapped_in_after_lstat_does_not_block(tmp_path, monkeypatch):
+    """The race: lstat sees a regular file, the open meets a FIFO."""
+    root = tmp_path / "ob"
+    p = _put(root)
+    real_lstat = Path.lstat
+    seen = {}
+
+    def lstat_then_swap(self):
+        st = real_lstat(self)
+        if self == p and not seen:
+            seen["done"] = True
+            self.unlink()
+            os.mkfifo(self)
+        return st
+
+    monkeypatch.setattr(Path, "lstat", lstat_then_swap)
+    with pytest.raises(ob.OutboxRejection) as ei:
+        ob.read_and_validate(p, {SRC})
+    assert ei.value.reason == "not_regular_file"

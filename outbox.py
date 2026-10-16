@@ -160,6 +160,23 @@ def parse_outboxes(spec: str | None) -> list[OutboxRoot]:
     return roots
 
 
+def parse_ts(ts: object) -> datetime | None:
+    """Parse a contract ``ts``, or None. Timezone-aware results only.
+
+    A trailing ``Z`` is normalised to ``+00:00`` first: ``datetime.fromisoformat``
+    accepts it from Python 3.11 but not on 3.10, which this package still supports, and
+    a contract whose answer depends on the drainer's Python version is two contracts.
+    """
+    if not isinstance(ts, str):
+        return None
+    text = ts[:-1] + "+00:00" if ts.endswith(("Z", "z")) else ts
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
 def validate_event(obj: object, name: str, allowed_sources: frozenset[str] | set[str]) -> dict:
     """Validate a decoded outbox body against the contract. Returns it, or raises.
 
@@ -177,12 +194,7 @@ def validate_event(obj: object, name: str, allowed_sources: frozenset[str] | set
         raise OutboxRejection("bad_fields", f"missing={missing} extra={extra}")
     if obj["id"] != m.group(2):
         raise OutboxRejection("id_mismatch")
-    ts = obj["ts"]
-    try:
-        parsed = datetime.fromisoformat(ts) if isinstance(ts, str) else None
-    except ValueError:
-        parsed = None
-    if parsed is None or parsed.tzinfo is None:
+    if parse_ts(obj["ts"]) is None:
         raise OutboxRejection("bad_ts")
     event = obj["event"]
     if not isinstance(event, str) or event not in CROSS_AGENT_EVENTS:
@@ -219,13 +231,24 @@ def read_and_validate(path: Path, allowed_sources: frozenset[str] | set[str]) ->
     if st.st_size > MAX_FILE_BYTES:
         raise OutboxRejection("too_large", f"{st.st_size} bytes")
     try:
-        # O_NOFOLLOW closes the window between lstat and open: a file swapped for a
-        # symlink in between fails here instead of being read through.
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(fd, "rb") as f:
-            raw = f.read(MAX_FILE_BYTES + 1)
+        # The lstat above can be raced: the path can be swapped between it and this
+        # open. O_NOFOLLOW refuses a swapped-in symlink. O_NONBLOCK stops a swapped-in
+        # FIFO from blocking the open until a writer appears, which would hang the
+        # drain thread and with it every root. The type and owner checks are then
+        # repeated on the descriptor itself, which is what is actually read.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         raise OutboxRejection("unreadable", exc.__class__.__name__) from None
+    with os.fdopen(fd, "rb") as f:
+        fst = os.fstat(f.fileno())
+        if not stat.S_ISREG(fst.st_mode):
+            raise OutboxRejection("not_regular_file", "changed after lstat")
+        if fst.st_uid != os.getuid():
+            raise OutboxRejection("foreign_owner", f"uid {fst.st_uid}, changed after lstat")
+        try:
+            raw = f.read(MAX_FILE_BYTES + 1)
+        except OSError as exc:
+            raise OutboxRejection("unreadable", exc.__class__.__name__) from None
     if len(raw) > MAX_FILE_BYTES:
         raise OutboxRejection("too_large", "grew after stat")
     try:
@@ -402,7 +425,7 @@ class Drainer:
                     "id": obj["id"],
                     # Normalised to the +00:00 form every other writer uses:
                     # query_events filters `since` by string comparison.
-                    "ts": datetime.fromisoformat(obj["ts"]).astimezone(timezone.utc).isoformat(),
+                    "ts": parse_ts(obj["ts"]).astimezone(timezone.utc).isoformat(),
                     "event": obj["event"],
                     "scope": "cross-agent",
                     "source": obj["source"],
