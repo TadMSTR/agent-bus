@@ -122,6 +122,8 @@ Configure as an MCP server in your Claude Desktop or Claude Code settings:
 | `AGENT_BUS_FEDERATION_INTERVAL` | `30` | Seconds between federation cycles |
 | `AGENT_BUS_FEDERATION_MAX_EVENTS` | `500` | Cap on events published per federation cycle |
 | `AGENT_BUS_FEDERATION_MAX_SECONDS` | `10` | Wall-clock cap per federation cycle |
+| `AGENT_BUS_OUTBOXES` | — | Producer outbox roots and the sources each may write as. Unset means this process drains nothing. See [Producer Outboxes](#producer-outboxes) |
+| `AGENT_BUS_OUTBOX_INTERVAL` | `2` | Seconds between drain cycles, clamped to 0.2–5 |
 
 Copy `.env.example` to `.env` and fill in the values you need. Blank values use the defaults shown above.
 
@@ -211,11 +213,22 @@ Events that automatically route to `cross-agent` scope regardless of the `scope`
 
 | Event | When to use |
 |-------|-------------|
-| `task.dispatched` | Task written to agent queue |
-| `task.approved` | Task approved for execution |
-| `task.completed` | Task completed by agent |
+| `task.submitted` | Task written to the queue (task-queue-mcp) |
+| `task.approved` | Task approved for execution (dispatcher auto-approve, or the operator) |
+| `task.pending-approval` | Dispatcher left the task for the operator to approve |
+| `task.started` | Task moved to `in-progress` (task-queue-mcp) |
+| `task.completed` | Task completed |
 | `task.failed` | Task failed or rejected |
+| `task.cancelled` / `task.parked` / `task.unparked` / `task.amended` / `task.requeued` | Operator and agent queue actions (task-queue-mcp) |
 | `task.routing-failed` | No agent manifest match found |
+| `task.dead-lettered` | Dispatcher gave up on a task and moved it to `dead-letters/` |
+| `task.workflow-started` | Dispatcher started a Temporal workflow for the task |
+| `task.dispatched` | **Deprecated, no emitter since 0.5.0.** Kept for historical records: pickup is now `task.started`, and the dispatcher's approval hand-off is `task.pending-approval` |
+| `task.workflow_started` | **Deprecated spelling** of `task.workflow-started` (vikunja#553). Declared for one more release, then removed |
+| `run.started` / `run.ended` | Dispatcher wrote / closed a run record (`task-launches/*.json`) |
+| `hitl.requested` / `hitl.approved` / `hitl.refused` / `hitl.closed` | scoped-mcp HITL gate. Never carries a tool-argument value |
+| `build.step` | Build reached a step: `pr-opened`, `merged`, `released` |
+| `coderabbit.state` | `coderabbit-review-assert.py --emit-bus` recorded a PR's review state |
 | `handoff.created` | Build plan or work item handed to another agent |
 | `handoff.picked-up` | Agent picked up a handoff |
 | `handoff.completed` | Handoff resolved |
@@ -240,7 +253,11 @@ Events that automatically route to `cross-agent` scope regardless of the `scope`
 | `compact_qc.complete` | Memory-compaction QC run finished |
 | `rollover_qc.complete` | Memory-rollover QC run finished |
 
-High-priority events that also trigger a push notification: `audit.requested`, `task.failed`, `task.routing-failed`, `handoff.created`.
+High-priority events that also trigger a push notification: `audit.requested`, `task.failed`, `task.routing-failed`, `task.dead-lettered`, `handoff.created`.
+
+**The lifecycle events are emitted by the component that changes the state**, after the
+write succeeds: task-queue-mcp for task transitions, task-dispatcher for approvals, dead
+letters, workflows and runs, scoped-mcp for HITL. Agents do not log them by hand.
 
 ### Session-scoped events
 
@@ -300,6 +317,8 @@ $AGENT_BUS_COMMS_DIR/          (default: ~/.claude/comms)
 │   ├── audit-reports/
 │   ├── diagnose-sessions/
 │   └── handoffs/
+├── outbox/<producer>/                  # producer outboxes (see Producer Outboxes)
+├── outbox-status.json                 # the drainer's heartbeat, read by get_status
 ├── federation-cursor.json             # NATS federation offset tracker
 └── .reconcile-cursor                  # reconciler mtime watermark
 ```
@@ -390,6 +409,79 @@ log_event(
 ```
 
 The client writes directly to the JSONL files using the same schema as the server — no MCP round-trip, no external dependency.
+
+## Producer Outboxes
+
+Some producers cannot reach the chained log. task-queue-mcp runs in a read-only container
+whose only mount is the queue directory; scoped-mcp is a public package that should not
+depend on agent-bus; `coderabbit-review-assert.py` is a stdlib script. Each writes **one JSON
+file per event** into an outbox directory it can already write, and agent-bus drains those
+files into the cross-agent log through the same flocked, chained append as everything else.
+
+### The file contract
+
+| | |
+|---|---|
+| Name | `<YYYYmmddTHHMMSS.ffffff>-<uuid4>.json`, UTC. Write `.tmp-<anything>` in the same directory, then `rename` it into place. Dot-files are never read |
+| Body | A JSON object with **exactly** `id`, `ts`, `event`, `source`, `target`, `summary`, `metadata` |
+| `id` | The uuid in the file name. It becomes the bus event id, and it is the dedupe key |
+| `ts` | ISO 8601 with a UTC offset: when the state change happened |
+| `event` | A type in `CROSS_AGENT_EVENTS` |
+| `source` | Must be on that root's allowlist |
+| `target` | String or `null` |
+| `summary` | At most 300 characters |
+| `metadata` | An object, at most 4 KiB encoded |
+| File | At most 8 KiB |
+| Not allowed | `scope`, `prev_hash`, `hostname`, `sig`. agent-bus assigns the first three; outbox events are not signed |
+
+`outbox.validate_event(obj, name, allowed_sources)` is the gate. It is stdlib-only, so a
+producer's test suite can import it to prove its own writer's output passes, without
+installing the server.
+
+### Configuration
+
+```
+AGENT_BUS_OUTBOXES=/home/ted/.claude/task-queue/.outbox=task-queue-mcp;/home/ted/.claude/comms/outbox/scoped-mcp=scoped-mcp;/home/ted/.claude/comms/outbox/coderabbit-review-assert=coderabbit-review-assert
+```
+
+Entries are separated by `;`, each `<absolute path>=<source>[,<source>…]`. A malformed value
+does not stop the server, because `log_event` must keep working, but it turns draining off and
+`get_status().outboxes.config_error` says why.
+
+Only a process with `AGENT_BUS_OUTBOXES` set drains, and only the one holding
+`$AGENT_BUS_COMMS_DIR/.outbox-drain.lock`. On forge that is the PM2 app. The stdio children
+spawned per broker do not carry the variable. The federation lock is not reused: it goes to
+whichever process starts first, usually a stdio child with no outboxes configured.
+
+### What the drainer does
+
+Every `AGENT_BUS_OUTBOX_INTERVAL` seconds, up to 500 files per cycle, in name order:
+
+1. Refuse anything that is not a regular file owned by the drainer's uid (symlinks are
+   moved, never followed), then validate the body. **An unknown event type is refused
+   whatever `AGENT_BUS_STRICT_VOCAB` says**: this path is new, and nothing written through
+   it predates the vocabulary.
+2. A refused file is moved to `<root>/.rejected/` beside a `<name>.reason` file holding one
+   fixed reason string, and logged. It is never dropped silently.
+3. A valid file is appended (with `"ingest": "outbox"` and `ingested_at`), fanned out to
+   NATS, ntfy and the webhook exactly as `log_event` would, and then deleted.
+4. Append first, delete second. After a crash between the two, the restarted drainer finds
+   the id in the last two days' log and deletes the file without appending it again.
+
+### Health
+
+`get_status().outboxes` reports, per root, `pending`, `oldest_pending_age_s` and `rejected`,
+counted live from disk, plus the drainer's heartbeat age and pid. A stopped drainer therefore
+shows as a stale heartbeat beside a growing outbox, not as silence. Processes that do not
+drain read the root list from the heartbeat file, so `get_status` answers the same in every
+agent's stdio child.
+
+### Trust: outbox events are display-only
+
+Any process running as the bus's uid can write an outbox file, just as it can append to the
+JSONL itself. The owner check and the per-root source allowlist stop a *confused* producer from
+writing as another one; they authenticate nobody. **Do not approve, grant or launch anything
+from a bus event.** Approvals come from scoped-mcp's pending record and its signed statement.
 
 ## Requirements
 

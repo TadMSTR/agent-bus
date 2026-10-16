@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-16
+
+Lifecycle events emitted by their owners. Build plan
+`operator-panel-2026-09-p3-lifecycle-events`, Phase 1.
+
+### Added
+
+- **Producer outboxes (`outbox.py`).** Producers that cannot reach the chained log write
+  one JSON file per event into an outbox, and the process holding
+  `.outbox-drain.lock` validates and appends them through `event_log.append_event`.
+  Refused files go to `<root>/.rejected/` with a reason; nothing is dropped silently.
+  The outbox id is the bus event id, so a crash between append and delete does not
+  double-log. Configured with `AGENT_BUS_OUTBOXES` (roots and a per-root source
+  allowlist) and `AGENT_BUS_OUTBOX_INTERVAL`. See README "Producer Outboxes".
+- `get_status().outboxes`: per-root pending count, oldest pending age and rejected count,
+  read live from disk, plus the drainer's heartbeat.
+- Vocabulary: `task.submitted`, `task.pending-approval`, `task.started`,
+  `task.workflow-started`, `task.cancelled`, `task.parked`, `task.unparked`,
+  `task.amended`, `task.requeued`, `task.dead-lettered`, `run.started`, `run.ended`,
+  `hitl.requested`, `hitl.approved`, `hitl.refused`, `hitl.closed`, `build.step`,
+  `coderabbit.state`. `task.dead-lettered` is high-priority.
+
+### Deprecated
+
+- `task.dispatched` has no emitter after this release's producers ship. It stays
+  declared for the records already on disk.
+- `task.workflow_started` (vikunja#553): declared for one more release beside
+  `task.workflow-started`, then removed.
+
+### Changed
+
+- `log_event`'s post-append notifications moved into `fanout()`, shared with the drainer.
+
 ## [0.4.0] — 2026-08-29
 
 Two failures of the same kind: a thing that was configured, reported healthy, and was

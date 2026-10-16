@@ -72,7 +72,7 @@ jobs:
       - name: Install the bare wheel — the client path must need no extras
         run: |
           pip install dist/*.whl
-          python -c "import agent_bus_client, event_log, event_vocab"
+          python -c "import agent_bus_client, event_log, event_vocab, outbox"
           python -c "import importlib.util as u, sys; p=[m for m in ('fastmcp','cryptography','nats') if u.find_spec(m)]; sys.exit('bare wheel pulled in server deps: '+repr(p)) if p else None"
 
       - name: Install the server extra and import every module

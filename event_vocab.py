@@ -68,6 +68,37 @@ CROSS_AGENT_EVENTS = frozenset(
         # break consumers querying by event type and 3 months of records already on disk,
         # so it needs a migration rather than a drive-by rename — vikunja#553.)
         "task.workflow_started",
+        # ── Owner-emitted lifecycle events, declared 2026-10-16 (operator-panel-2026-09
+        # part 3). Each is written by the component that makes the state change — mostly
+        # through the producer outbox (outbox.py), the dispatcher through
+        # agent_bus_client — and never by an agent following prose.
+        #
+        # `task.dispatched` above STAYS DECLARED for the months of records already on
+        # disk, but has no emitter after part 3: pickup is `task.started` (task-queue-mcp)
+        # and the dispatcher's approval hand-off is `task.pending-approval`, which it used
+        # to mislabel as `task.dispatched`.
+        #
+        # `task.workflow_started` above is the vikunja#553 spelling. Both are declared for
+        # one release so nothing written in the changeover is refused; the dispatcher
+        # emits only the hyphenated one, and the underscore goes in the next release.
+        "task.submitted",
+        "task.pending-approval",
+        "task.started",
+        "task.workflow-started",
+        "task.cancelled",
+        "task.parked",
+        "task.unparked",
+        "task.amended",
+        "task.requeued",
+        "task.dead-lettered",
+        "run.started",
+        "run.ended",
+        "hitl.requested",
+        "hitl.approved",
+        "hitl.refused",
+        "hitl.closed",
+        "build.step",
+        "coderabbit.state",
         "handoff.created",
         "handoff.picked-up",
         "handoff.completed",
@@ -122,6 +153,8 @@ HIGH_PRIORITY_EVENTS = frozenset(
         "audit.requested",
         "task.failed",
         "task.routing-failed",
+        # vikunja#557: seventeen audits were dead-lettered with nobody told.
+        "task.dead-lettered",
         "handoff.created",
     }
 )

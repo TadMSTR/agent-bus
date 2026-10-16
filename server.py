@@ -29,6 +29,7 @@ from event_vocab import (
     unknown_event_reason,
 )
 from nats_publisher import NatsPublisher
+from outbox import Drainer, OutboxRoot, parse_outboxes, root_status
 
 # Re-exported: the vocabulary is documented as part of this module's surface, and
 # external callers import it from here. event_vocab is the single definition.
@@ -63,10 +64,12 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 @asynccontextmanager
 async def lifespan(server):
     task = asyncio.create_task(federation_loop())
+    drain = asyncio.create_task(outbox_drain_loop())
     try:
         yield
     finally:
         task.cancel()
+        drain.cancel()
         _publisher.close()
 
 
@@ -74,6 +77,8 @@ mcp = FastMCP("agent-bus", lifespan=lifespan)
 
 CURSOR_FILE = COMMS_DIR / "federation-cursor.json"
 FEDERATION_LOCK_FILE = COMMS_DIR / ".federation.lock"
+OUTBOX_LOCK_FILE = COMMS_DIR / ".outbox-drain.lock"
+OUTBOX_STATUS_FILE = COMMS_DIR / "outbox-status.json"
 HOSTNAME = os.uname().nodename
 NTFY_URL = os.environ.get("NTFY_URL", "")
 NATS_URL = os.environ.get("NATS_URL", "nats://localhost:4222")
@@ -92,6 +97,26 @@ FEDERATION_INTERVAL = _env_num("AGENT_BUS_FEDERATION_INTERVAL", 30, int)
 FEDERATION_MAX_EVENTS_PER_CYCLE = _env_num("AGENT_BUS_FEDERATION_MAX_EVENTS", 500, int)
 FEDERATION_MAX_SECONDS_PER_CYCLE = _env_num("AGENT_BUS_FEDERATION_MAX_SECONDS", 10.0, float)
 FEDERATION_STARTUP_DELAY = 10
+
+# ── Producer outboxes (see outbox.py for the file contract) ─────────────────────
+# Only a process with AGENT_BUS_OUTBOXES set ever drains. On forge that is the PM2 app:
+# the variable is in ecosystem.config.js, and the stdio children the brokers spawn do
+# not carry it. That is deliberate. The federation lock would hand draining to
+# whichever process started first, which is usually a stdio child with no outboxes
+# configured, so draining has its own lock and only configured processes contend for it.
+#
+# A malformed spec does not crash the server: log_event must keep working for every
+# agent. It disables draining and get_status reports the error, so it is not silent.
+OUTBOX_CONFIG_ERROR: str | None = None
+try:
+    OUTBOXES: list[OutboxRoot] = parse_outboxes(os.environ.get("AGENT_BUS_OUTBOXES"))
+except ValueError as _exc:
+    OUTBOXES = []
+    OUTBOX_CONFIG_ERROR = str(_exc)
+    _log.error("AGENT_BUS_OUTBOXES is malformed, outbox draining is OFF: %s", _exc)
+# The plan's ceiling is 5 s; a value outside (0, 5] is clamped rather than obeyed.
+OUTBOX_INTERVAL = min(max(_env_num("AGENT_BUS_OUTBOX_INTERVAL", 2.0, float), 0.2), 5.0)
+OUTBOX_STATUS_EVERY = 30.0
 
 CURSOR_VERSION = 2
 
@@ -411,6 +436,16 @@ def emit_webhook(event: dict) -> None:
         )
 
 
+def fanout(event: dict) -> None:
+    """Everything that happens after an event is on disk. Shared by log_event and the
+    outbox drainer, so an owner-emitted event notifies exactly as a hand-logged one did.
+    """
+    if event["event"] in HIGH_PRIORITY_EVENTS:
+        emit_ntfy(event)
+    emit_nats(event)
+    emit_webhook(event)
+
+
 @mcp.tool()
 def log_event(
     event_type: str,
@@ -472,12 +507,7 @@ def log_event(
             )
 
     append_event(event, scope_resolved)
-
-    if event_type in HIGH_PRIORITY_EVENTS:
-        emit_ntfy(event)
-
-    emit_nats(event)
-    emit_webhook(event)
+    fanout(event)
     return {"id": event["id"], "logged": True, "scope": scope_resolved}
 
 
@@ -687,6 +717,7 @@ def get_status() -> dict:
         },
         "logs": date_range,
         "events_today": today_count,
+        "outboxes": outbox_status(),
     }
 
 
@@ -895,6 +926,131 @@ async def federation_loop() -> None:
             _log.warning("federation_loop error: %s", exc)
 
         await asyncio.sleep(FEDERATION_INTERVAL)
+
+
+# ── Outbox drain background task ──────────────────────────────────────────────
+
+_outbox_lock_fd = None
+_drainer: Drainer | None = None
+
+
+def acquire_outbox_lock(lock_path: Path | None = None) -> bool:
+    """Elect one draining process. Same shape as acquire_federation_lock, its own file."""
+    global _outbox_lock_fd
+    if _outbox_lock_fd is not None:
+        return True
+    path = lock_path or OUTBOX_LOCK_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = open(path, "w")  # noqa: SIM115 — held for the process lifetime
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fd.close()
+        return False
+    _outbox_lock_fd = fd
+    return True
+
+
+def release_outbox_lock() -> None:
+    global _outbox_lock_fd
+    if _outbox_lock_fd is None:
+        return
+    with contextlib.suppress(OSError):
+        fcntl.flock(_outbox_lock_fd.fileno(), fcntl.LOCK_UN)
+        _outbox_lock_fd.close()
+    _outbox_lock_fd = None
+
+
+def _make_drainer() -> Drainer:
+    return Drainer(
+        roots=OUTBOXES,
+        logs_dir=LOGS_DIR,
+        hostname=HOSTNAME,
+        append=lambda e: append_event(e, "cross-agent"),
+        fanout=fanout,
+    )
+
+
+def write_outbox_status() -> None:
+    """Heartbeat for get_status in processes that do not drain (every stdio child).
+
+    It records which roots the drainer serves and when it last ran. Pending and
+    rejected counts are NOT taken from here: get_status recounts them from disk, so a
+    stopped drainer shows as a stale heartbeat beside a growing outbox, not as a frozen
+    healthy number.
+    """
+    body = {
+        "pid": os.getpid(),
+        "written_at": datetime.now(timezone.utc).isoformat(),
+        "interval_seconds": OUTBOX_INTERVAL,
+        "roots": [{"path": str(r.path), "sources": sorted(r.sources)} for r in OUTBOXES],
+        "stats": _drainer.stats() if _drainer else None,
+    }
+    tmp = OUTBOX_STATUS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(body, indent=2))
+    tmp.rename(OUTBOX_STATUS_FILE)
+
+
+def outbox_status() -> dict:
+    """Per-root pending / oldest-pending age / rejected, plus the drainer's heartbeat."""
+    heartbeat = None
+    roots = OUTBOXES
+    with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
+        heartbeat = json.loads(OUTBOX_STATUS_FILE.read_text())
+    if not roots and heartbeat:
+        roots = [
+            OutboxRoot(path=Path(r["path"]), sources=frozenset(r["sources"]))
+            for r in heartbeat.get("roots", [])
+        ]
+    hb_age = None
+    if heartbeat and heartbeat.get("written_at"):
+        with contextlib.suppress(ValueError):
+            hb_age = round(
+                (
+                    datetime.now(timezone.utc) - datetime.fromisoformat(heartbeat["written_at"])
+                ).total_seconds(),
+                1,
+            )
+    return {
+        "configured_in_this_process": bool(OUTBOXES),
+        "config_error": OUTBOX_CONFIG_ERROR,
+        "draining_in_this_process": _outbox_lock_fd is not None,
+        "drainer_heartbeat_age_s": hb_age,
+        "drainer_pid": heartbeat.get("pid") if heartbeat else None,
+        "drainer_stats": heartbeat.get("stats") if heartbeat else None,
+        "roots": [root_status(r) for r in roots],
+    }
+
+
+async def outbox_drain_loop() -> None:
+    """Background task: drain configured outboxes every OUTBOX_INTERVAL seconds."""
+    global _drainer
+    if not OUTBOXES:
+        return
+    last_status = 0.0
+    while True:
+        try:
+            if not acquire_outbox_lock():
+                await asyncio.sleep(FEDERATION_INTERVAL)
+                continue
+            if _drainer is None:
+                _drainer = _make_drainer()
+                _log.info("outbox draining %d root(s)", len(OUTBOXES))
+            appended = await asyncio.to_thread(_drainer.drain_once)
+            if appended:
+                _log.info("outbox ingested %d event(s)", appended)
+            now = time.monotonic()
+            if appended or now - last_status >= OUTBOX_STATUS_EVERY:
+                await asyncio.to_thread(write_outbox_status)
+                last_status = now
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log.warning("outbox_drain_loop error: %s", exc)
+        await asyncio.sleep(OUTBOX_INTERVAL)
 
 
 if __name__ == "__main__":
