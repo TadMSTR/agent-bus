@@ -441,7 +441,7 @@ installing the server.
 ### Configuration
 
 ```
-AGENT_BUS_OUTBOXES=/home/ted/.claude/task-queue/.outbox=task-queue-mcp;/home/ted/.claude/comms/outbox/scoped-mcp=scoped-mcp;/home/ted/.claude/comms/outbox/coderabbit-review-assert=coderabbit-review-assert
+AGENT_BUS_OUTBOXES=/srv/agents/task-queue/.outbox=task-queue-mcp;/srv/agents/comms/outbox/scoped-mcp=scoped-mcp;/srv/agents/comms/outbox/coderabbit-review-assert=coderabbit-review-assert
 ```
 
 Entries are separated by `;`, each `<absolute path>=<source>[,<source>…]`. A malformed value

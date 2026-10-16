@@ -126,8 +126,8 @@ def parse_outboxes(spec: str | None) -> list[OutboxRoot]:
 
     Shape: entries separated by ``;``, each ``<absolute path>=<source>[,<source>...]``::
 
-        /home/ted/.claude/task-queue/.outbox=task-queue-mcp;
-        /home/ted/.claude/comms/outbox/scoped-mcp=scoped-mcp
+        /srv/agents/task-queue/.outbox=task-queue-mcp;
+        /srv/agents/comms/outbox/scoped-mcp=scoped-mcp
 
     ``;`` rather than ``:`` so the list cannot be mistaken for a PATH-style variable,
     which has no place to put the allowlist. A root with no source would accept nothing
@@ -379,20 +379,29 @@ class Drainer:
         try:
             rej.mkdir(mode=0o700, exist_ok=True)
             os.rename(path, rej / path.name)
-            (rej / f"{path.name}.reason").write_text(
-                json.dumps(
-                    {
-                        "reason": exc.reason,
-                        "detail": exc.detail,
-                        "at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
-                + "\n"
+            reason_body = json.dumps(
+                {
+                    "reason": exc.reason,
+                    "detail": exc.detail,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
             )
+            # 0600 explicitly, not the umask: the detail quotes producer-written text.
+            fd = os.open(rej / f"{path.name}.reason", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(reason_body + "\n")
         except OSError as move_exc:
-            _log.error("outbox could not quarantine %s (%s): %s", path, exc.reason, move_exc)
+            _log.error("outbox could not quarantine %r (%s): %s", str(path), exc.reason, move_exc)
             return
-        _log.warning("outbox_rejected root=%s file=%s reason=%s", root.path, path.name, exc)
+        # %r, not %s: the file name and the detail are producer-written, and a newline in
+        # either must not forge a second log line.
+        _log.warning(
+            "outbox_rejected root=%r file=%r reason=%s detail=%r",
+            str(root.path),
+            path.name,
+            exc.reason,
+            exc.detail,
+        )
 
     def drain_once(self) -> int:
         """Ingest up to ``max_per_cycle`` files across all roots. Returns events appended."""

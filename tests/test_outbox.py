@@ -503,3 +503,17 @@ def test_a_fifo_swapped_in_after_lstat_does_not_block(tmp_path, monkeypatch):
     with pytest.raises(ob.OutboxRejection) as ei:
         ob.read_and_validate(p, {SRC})
     assert ei.value.reason == "not_regular_file"
+
+
+def test_reason_file_is_0600_and_the_log_line_cannot_be_split(tmp_path, caplog):
+    p = _put(tmp_path / "ob", body=lambda e: _body(e, source="evil\ninjected=1"))
+    d, _ = _drainer(p.parent, tmp_path / "logs")
+    d.drain_once()
+    reason = p.parent / ob.REJECTED_DIR / f"{p.name}.reason"
+    assert oct(reason.stat().st_mode & 0o777) == "0o600"
+    assert all("\n" not in r.getMessage() for r in caplog.records)
+
+
+def test_heartbeat_file_is_0600(served, comms_dir):
+    ab.write_outbox_status()
+    assert oct((comms_dir / "outbox-status.json").stat().st_mode & 0o777) == "0o600"
