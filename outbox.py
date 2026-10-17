@@ -478,6 +478,9 @@ class Drainer:
     stuck_skip_cycles: int = 10
     stuck_limit: int = 10000
     _stuck: OrderedDict[tuple[str, str], int] = field(default_factory=OrderedDict)
+    # (root path, entry name) -> event id, for files appended but not deleted. Not
+    # subject to _seen's eviction; dropped when the file is gone (round 3 R3-01).
+    _appended_stuck: OrderedDict[tuple[str, str], str] = field(default_factory=OrderedDict)
     _cycle: int = 0
     last_cycle: str | None = None
 
@@ -670,12 +673,15 @@ class Drainer:
             if self._stuck[key] <= 0:
                 del self._stuck[key]
 
-    def _still_there(self, dir_fd: int, root: OutboxRoot, name: str) -> None:
-        """Remember an entry that survived handling, so later cycles skip it for a while."""
+    def _still_there(self, dir_fd: int, root: OutboxRoot, name: str) -> bool:
+        """Remember an entry that survived handling, so later cycles skip it for a while.
+
+        Returns whether it is still there.
+        """
         try:
             os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
         except OSError:
-            return
+            return False
         key = (str(root.path), name)
         self._stuck[key] = self.stuck_skip_cycles
         self._stuck.move_to_end(key)
@@ -687,6 +693,7 @@ class Drainer:
             name,
             self.stuck_skip_cycles,
         )
+        return True
 
     def _drain_root(self, dir_fd: int, root: OutboxRoot, budget: int) -> int:
         appended = 0
@@ -707,8 +714,10 @@ class Drainer:
                 )
                 self._still_there(dir_fd, root, name)
                 continue
-            if obj["id"] in self._seen:
+            key = (rkey, name)
+            if obj["id"] in self._seen or self._appended_stuck.get(key) == obj["id"]:
                 self.duplicates += 1
+                self._remember(obj["id"])
                 # Logged, not silent (audit F-09): a duplicate is either a crash replay or
                 # a producer reusing an id, and only the log can tell which.
                 _log.warning(
@@ -719,7 +728,8 @@ class Drainer:
                     obj["source"],
                 )
                 self._unlink(dir_fd, name)
-                self._still_there(dir_fd, root, name)
+                if not self._still_there(dir_fd, root, name):
+                    self._appended_stuck.pop(key, None)
                 continue
             event = {
                 "id": obj["id"],
@@ -746,7 +756,13 @@ class Drainer:
                 raise _AppendFailed from exc
             self._remember(obj["id"])
             self._unlink(dir_fd, name)
-            self._still_there(dir_fd, root, name)
+            if self._still_there(dir_fd, root, name):
+                # Appended, but the file could not be deleted. Its id is pinned here, out of
+                # _seen's FIFO eviction, for as long as the file stays (round 3 R3-01): a
+                # later retry must read it as a duplicate however many events came between.
+                self._appended_stuck[key] = obj["id"]
+                while len(self._appended_stuck) > self.stuck_limit:
+                    self._appended_stuck.popitem(last=False)
             appended += 1
             self.drained += 1
             try:

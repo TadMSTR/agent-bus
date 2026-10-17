@@ -798,3 +798,22 @@ def test_r2_03_drops_are_reported_per_root(tmp_path, monkeypatch):
     d, _ = _drainer(root, tmp_path / "logs")
     d.drain_once()
     assert d.stats()["dropped_by_root"] == {str(root): 2}
+
+
+def test_r3_01_a_stuck_valid_file_is_appended_once_however_long_it_stays(tmp_path):
+    """Security's probe: a valid event in a read-only root (append ok, unlink fails),
+    seen_limit forced small, 10 other events per cycle: appended 6x at 86caf84."""
+    a, b, d, rec = _two_roots(tmp_path)
+    d.seen_limit = 5
+    d.stuck_skip_cycles = 1
+    stuck = _put(a)
+    stuck_id = json.loads(stuck.read_text())["id"]
+    a.chmod(0o555)
+    try:
+        for _ in range(12):
+            for _ in range(10):
+                _put(b)
+            d.drain_once()
+    finally:
+        a.chmod(0o700)
+    assert [e["id"] for e in rec.appended].count(stuck_id) == 1
