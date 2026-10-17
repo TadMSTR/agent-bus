@@ -471,6 +471,14 @@ class Drainer:
     duplicates: int = 0
     rejected: int = 0
     dropped: int = 0
+    dropped_by_root: dict[str, int] = field(default_factory=dict)
+    # (root path, entry name) -> cycles left to skip it. An entry the drainer could not
+    # move or delete would otherwise come back first every cycle and use the budget
+    # again (round 2 R2-02). Bounded, and it expires, so a fixed entry is retried.
+    stuck_skip_cycles: int = 10
+    stuck_limit: int = 10000
+    _stuck: OrderedDict[tuple[str, str], int] = field(default_factory=OrderedDict)
+    _cycle: int = 0
     last_cycle: str | None = None
 
     def seed(self) -> None:
@@ -508,15 +516,20 @@ class Drainer:
         symlink included, and never what a symlink points at.
         """
         self.dropped += 1
+        key = str(root.path)
+        self.dropped_by_root[key] = self.dropped_by_root.get(key, 0) + 1
         try:
             os.unlink(name, dir_fd=dir_fd)
-        except (IsADirectoryError, PermissionError):
-            # A directory is never removed recursively from here: left for a human.
+        except (IsADirectoryError, PermissionError) as left:
+            # A directory is never removed recursively from here, and a root the producer
+            # made read-only refuses the unlink. Either way it is left for a human; the
+            # stuck-entry skip keeps it from using the budget every cycle.
             _log.error(
-                "outbox_left_in_place root=%r file=%r why=%s (a directory)",
+                "outbox_left_in_place root=%r file=%r why=%s (%s)",
                 str(root.path),
                 name,
                 why,
+                type(left).__name__,
             )
             return
         except OSError as exc:
@@ -531,7 +544,10 @@ class Drainer:
         in its own root, including a ``.rejected`` symlink pointing anywhere the drainer
         can write (audit F-01); that is refused, not followed.
         """
-        with contextlib.suppress(FileExistsError):
+        # Any mkdir failure (EACCES on a root the producer made read-only, ENOSPC,
+        # EROFS, EDQUOT), not only EEXIST, means "no safe quarantine here": the open below
+        # then fails or the checks refuse it, and the caller drops instead (round 2 R2-01).
+        with contextlib.suppress(OSError):
             os.mkdir(REJECTED_DIR, 0o700, dir_fd=dir_fd)
         try:
             rfd = os.open(REJECTED_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
@@ -543,16 +559,41 @@ class Drainer:
             return None
         return rfd
 
-    def _reject(self, dir_fd: int, root: OutboxRoot, name: str, exc: OutboxRejection) -> None:
+    def _reject(
+        self, dir_fd: int, root: OutboxRoot, name: str, exc: OutboxRejection, cycle: dict
+    ) -> None:
+        """Quarantine one entry. Never raises (round 2 R2-01): a failure here is logged,
+        and the entry is left for the stuck-entry skip rather than aborting the cycle.
+
+        ``cycle`` carries this root's quarantine count for the cycle, read once and kept
+        locally (R2-03), instead of rescanning ``.rejected`` on every rejection.
+        """
+        try:
+            self._reject_unguarded(dir_fd, root, name, exc, cycle)
+        except Exception as unexpected:
+            _log.error(
+                "outbox quarantine failed for %r in %r: %s: %s",
+                name,
+                str(root.path),
+                type(unexpected).__name__,
+                unexpected,
+            )
+
+    def _reject_unguarded(
+        self, dir_fd: int, root: OutboxRoot, name: str, exc: OutboxRejection, cycle: dict
+    ) -> None:
         self.rejected += 1
         rfd = self._quarantine_dir(dir_fd)
         if rfd is None:
             self._drop(dir_fd, root, name, f"{exc.reason}; .rejected is not a safe directory")
             return
         try:
-            count, _ = _count_rejected(dir_fd, REJECTED_LIMIT)
-            if count >= REJECTED_LIMIT:
-                self._drop(dir_fd, root, name, f"{exc.reason}; quarantine full ({count})")
+            if "rejected" not in cycle:
+                cycle["rejected"], _ = _count_rejected(dir_fd, REJECTED_LIMIT)
+            if cycle["rejected"] >= REJECTED_LIMIT:
+                self._drop(
+                    dir_fd, root, name, f"{exc.reason}; quarantine full ({cycle['rejected']})"
+                )
                 return
             # rename() acts on the entry, not on what a symlink entry points at, and both
             # ends are relative to descriptors that were checked.
@@ -577,6 +618,7 @@ class Drainer:
             )
             with os.fdopen(fd, "w") as f:
                 f.write(reason_body + "\n")
+            cycle["rejected"] += 1
         except OSError as move_exc:
             _log.error("outbox could not quarantine %r (%s): %s", name, exc.reason, move_exc)
             return
@@ -593,20 +635,28 @@ class Drainer:
         )
 
     def drain_once(self) -> int:
-        """Ingest up to ``max_per_cycle`` files across all roots. Returns events appended."""
+        """Ingest up to ``max_per_cycle`` files across all roots. Returns events appended.
+
+        The budget is shared fairly (round 2 R2-02): each root gets an equal share, and
+        the root that goes first rotates every cycle, so one producer's root cannot use
+        the whole cycle and starve the roots configured after it.
+        """
         if not self.seeded:
             self.seed()
         appended = 0
-        budget = self.max_per_cycle
-        for root in self.roots:
-            if budget <= 0:
-                break
+        if not self.roots:
+            self.last_cycle = datetime.now(timezone.utc).isoformat()
+            return 0
+        share = max(1, self.max_per_cycle // len(self.roots))
+        start = self._cycle % len(self.roots)
+        self._cycle += 1
+        self._age_stuck()
+        for root in self.roots[start:] + self.roots[:start]:
             dir_fd = open_root(root.path)
             if dir_fd is None:
                 continue  # absent (status reports exists=False) or unsafe (logged)
             try:
-                n, budget = self._drain_root(dir_fd, root, budget)
-                appended += n
+                appended += self._drain_root(dir_fd, root, share)
             except _AppendFailed:
                 break  # the log itself is unwritable: stop, keep every file for later
             finally:
@@ -614,18 +664,48 @@ class Drainer:
         self.last_cycle = datetime.now(timezone.utc).isoformat()
         return appended
 
-    def _drain_root(self, dir_fd: int, root: OutboxRoot, budget: int) -> tuple[int, int]:
+    def _age_stuck(self) -> None:
+        for key in list(self._stuck):
+            self._stuck[key] -= 1
+            if self._stuck[key] <= 0:
+                del self._stuck[key]
+
+    def _still_there(self, dir_fd: int, root: OutboxRoot, name: str) -> None:
+        """Remember an entry that survived handling, so later cycles skip it for a while."""
+        try:
+            os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError:
+            return
+        key = (str(root.path), name)
+        self._stuck[key] = self.stuck_skip_cycles
+        self._stuck.move_to_end(key)
+        while len(self._stuck) > self.stuck_limit:
+            self._stuck.popitem(last=False)
+        _log.error(
+            "outbox_stuck root=%r file=%r: could not be moved or deleted; skipped for %d cycles",
+            str(root.path),
+            name,
+            self.stuck_skip_cycles,
+        )
+
+    def _drain_root(self, dir_fd: int, root: OutboxRoot, budget: int) -> int:
         appended = 0
-        names, _ = list_pending(dir_fd, limit=max(budget, 1) * 4)
+        cycle: dict = {}
+        rkey = str(root.path)
+        names, _ = list_pending(dir_fd, limit=max(budget, 1) * 4 + len(self._stuck))
+        names = [n for n in names if (rkey, n) not in self._stuck]
         for name in names[:budget]:
-            budget -= 1
             try:
                 obj = read_and_validate_at(dir_fd, name, root.sources)
             except OutboxRejection as exc:
-                self._reject(dir_fd, root, name, exc)
+                self._reject(dir_fd, root, name, exc, cycle)
+                self._still_there(dir_fd, root, name)
                 continue
             except Exception as exc:  # any surprise is this file's problem (audit F-04)
-                self._reject(dir_fd, root, name, OutboxRejection("unreadable", type(exc).__name__))
+                self._reject(
+                    dir_fd, root, name, OutboxRejection("unreadable", type(exc).__name__), cycle
+                )
+                self._still_there(dir_fd, root, name)
                 continue
             if obj["id"] in self._seen:
                 self.duplicates += 1
@@ -633,12 +713,13 @@ class Drainer:
                 # a producer reusing an id, and only the log can tell which.
                 _log.warning(
                     "outbox_duplicate root=%r file=%r id=%s source=%r",
-                    str(root.path),
+                    rkey,
                     name,
                     obj["id"],
                     obj["source"],
                 )
                 self._unlink(dir_fd, name)
+                self._still_there(dir_fd, root, name)
                 continue
             event = {
                 "id": obj["id"],
@@ -665,13 +746,14 @@ class Drainer:
                 raise _AppendFailed from exc
             self._remember(obj["id"])
             self._unlink(dir_fd, name)
+            self._still_there(dir_fd, root, name)
             appended += 1
             self.drained += 1
             try:
                 self.fanout(event)
             except Exception as exc:  # fan-out never undoes an append
                 _log.warning("outbox fanout failed for %s: %s", obj["id"], exc)
-        return appended, budget
+        return appended
 
     @staticmethod
     def _unlink(dir_fd: int, name: str) -> None:
@@ -688,5 +770,7 @@ class Drainer:
             "duplicates": self.duplicates,
             "rejected": self.rejected,
             "dropped": self.dropped,
+            "dropped_by_root": dict(self.dropped_by_root),
+            "stuck": len(self._stuck),
             "last_cycle": self.last_cycle,
         }

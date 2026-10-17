@@ -692,3 +692,109 @@ def test_f04_an_unwritable_log_stops_the_cycle_and_keeps_the_files(tmp_path):
     assert d.drain_once() == 0
     assert a.exists() and b.exists()
     assert not (root / ob.REJECTED_DIR).exists()
+
+
+# ── round 2 (2026-10-17): one producer must not stop the others ─────────────
+
+
+def _two_roots(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(mode=0o700)
+    b.mkdir(mode=0o700)
+    rec = Recorder(tmp_path / "logs")
+    d = ob.Drainer(
+        roots=[ob.OutboxRoot(a, frozenset({SRC})), ob.OutboxRoot(b, frozenset({SRC}))],
+        logs_dir=tmp_path / "logs",
+        hostname="testhost",
+        append=rec.append,
+        fanout=rec.fanout,
+    )
+    return a, b, d, rec
+
+
+def test_r2_01_a_read_only_root_does_not_abort_the_cycle(tmp_path):
+    """Security's reproduction: root `a` 0555 with no .rejected and a junk entry raised
+    PermissionError out of drain_once, and root `b` drained nothing."""
+    a, b, d, rec = _two_roots(tmp_path)
+    (a / "junk").write_text("x")
+    _put(b)
+    a.chmod(0o555)
+    try:
+        assert d.drain_once() == 1
+        assert len(rec.appended) == 1
+        assert d.stats()["stuck"] == 1  # junk could not be moved or deleted
+    finally:
+        a.chmod(0o700)
+
+
+def test_r2_02_unmovable_entries_cannot_starve_later_roots(tmp_path):
+    """Security's reproduction: max_per_cycle=5; five bad files in `a`, each blocked by a
+    non-empty directory of the same name under .rejected/; `b` drained 0 in 3 cycles."""
+    a, b, d, rec = _two_roots(tmp_path)
+    d.max_per_cycle = 5
+    rej = a / ob.REJECTED_DIR
+    rej.mkdir(mode=0o700)
+    for i in range(5):
+        (a / f"bad-{i}").write_text("x")
+        (rej / f"bad-{i}").mkdir()
+        (rej / f"bad-{i}" / "keep").write_text("x")
+    _put(b)
+    for _ in range(3):
+        d.drain_once()
+    assert len(rec.appended) == 1
+    assert d.stats()["stuck"] == 5
+
+
+def test_r2_02_stuck_entries_are_skipped_then_retried(tmp_path):
+    a, _b, d, _ = _two_roots(tmp_path)
+    d.stuck_skip_cycles = 2
+    (a / "junk").write_text("x")
+    a.chmod(0o555)
+    try:
+        d.drain_once()
+        assert d.stats()["stuck"] == 1
+        rejected_before = d.stats()["rejected"]
+        d.drain_once()  # skipped: not attempted again
+        assert d.stats()["rejected"] == rejected_before
+    finally:
+        a.chmod(0o700)
+    d.drain_once()  # skip expired and the root is writable again: quarantined
+    assert d.stats()["stuck"] == 0
+    assert (a / ob.REJECTED_DIR / "junk").exists()
+
+
+def test_r2_02_the_first_root_rotates(tmp_path):
+    a, b, d, rec = _two_roots(tmp_path)
+    d.max_per_cycle = 2  # one each
+    for _ in range(2):
+        _put(a, body=lambda e: _body(e, summary="from-a"))
+        _put(b, body=lambda e: _body(e, summary="from-b"))
+    d.drain_once()
+    d.drain_once()
+    order = [e["summary"] for e in rec.appended]
+    # Each cycle serves both roots (equal shares), and cycle 2 starts with the root
+    # cycle 1 served second. Pre-fix, `a` took the whole budget first: a, a, b, b.
+    assert order == ["from-a", "from-b", "from-b", "from-a"], order
+
+
+def test_r2_03_the_quarantine_is_counted_once_per_root_per_cycle(tmp_path, monkeypatch):
+    calls = []
+    real = ob._count_rejected
+    monkeypatch.setattr(ob, "_count_rejected", lambda *a: calls.append(1) or real(*a))
+    root = tmp_path / "ob"
+    for i in range(6):
+        _put(root, name=f"bad-{i}.json")
+    d, _ = _drainer(root, tmp_path / "logs")
+    d.drain_once()
+    assert len(calls) == 1
+    assert len([p for p in (root / ob.REJECTED_DIR).iterdir() if p.suffix != ".reason"]) == 6
+
+
+def test_r2_03_drops_are_reported_per_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(ob, "REJECTED_LIMIT", 1)
+    root = tmp_path / "ob"
+    for i in range(3):
+        _put(root, name=f"bad-{i}.json")
+    d, _ = _drainer(root, tmp_path / "logs")
+    d.drain_once()
+    assert d.stats()["dropped_by_root"] == {str(root): 2}

@@ -483,6 +483,14 @@ removed instead. The entry itself is removed, never what a symlink points at, an
 removal is logged as `outbox_dropped`. Directories are never removed. Each cycle reads at
 most 5000 entries per root, and `get_status` counts are capped the same way (`*_capped`).
 
+One producer cannot stop the others:
+- Each root gets an equal share of the 500-per-cycle budget, and the root served first
+  rotates every cycle.
+- Quarantine never raises out of the cycle.
+- An entry the drainer could not move or delete is skipped for 10 cycles (`stuck` in the
+  stats, logged as `outbox_stuck`), so it cannot use the budget every cycle.
+- Drops are counted per root (`dropped_by_root`).
+
 A file that raises anything unexpected is quarantined as `unreadable`, so it cannot stall
 its root or the roots after it. NaN/Infinity and metadata nested deeper than 16 levels are
 refused. If the chained log itself refuses an append, the cycle stops and every file stays

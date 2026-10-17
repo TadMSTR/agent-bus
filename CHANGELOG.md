@@ -34,6 +34,14 @@ Lifecycle events emitted by their owners. Build plan
   before the fix). Listing, status and quarantine are bounded (F-03). One malformed file
   can no longer stall a root, and NaN/Infinity and deep nesting are refused (F-04).
   Duplicate ids are logged (F-09).
+- Security re-check round 2:
+  - A failed `.rejected` mkdir, or any quarantine error, no longer aborts the cycle
+    (R2-01).
+  - The budget is shared per root with a rotating start, and entries that cannot be
+    moved are skipped for 10 cycles, so one producer cannot starve the roots after it
+    (R2-02).
+  - The quarantine is counted once per root per cycle, and drops are reported per root
+    (R2-03).
 
 ### Deprecated
 
