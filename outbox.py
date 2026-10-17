@@ -428,6 +428,15 @@ class Drainer:
                     continue
                 if obj["id"] in self._seen:
                     self.duplicates += 1
+                    # Logged, not silent (audit F-09): a duplicate is either a crash replay or
+                    # a producer reusing an id, and only the log can tell which.
+                    _log.warning(
+                        "outbox_duplicate root=%r file=%r id=%s source=%r",
+                        str(root.path),
+                        path.name,
+                        obj["id"],
+                        obj["source"],
+                    )
                     self._unlink(path)
                     continue
                 event = {
