@@ -57,6 +57,7 @@ This module is stdlib-only, like the client path, so a producer's test suite can
 from __future__ import annotations
 
 import contextlib
+import heapq
 import json
 import logging
 import os
@@ -273,24 +274,33 @@ def open_root(path: Path) -> int | None:
 
 
 def list_pending(dir_fd: int, limit: int | None = None) -> tuple[list[str], bool]:
-    """Pending entry names in name (= time) order, and whether the scan hit ``limit``.
+    """The ``limit`` oldest pending names (name = time order), and whether there were more.
 
-    Dot-entries are not pending. The scan stops at ``limit`` entries, so a flooded root
-    costs a bounded amount per cycle; past the limit, order is only within what was read.
+    Dot-entries are not pending. The scan reads at most SCAN_LIMIT entries, so a flooded
+    root costs a bounded amount per cycle (audit F-03), and keeps the ``limit`` smallest
+    names with a heap. ``scandir`` returns directory order, not name order: taking the
+    first ``limit`` entries it returns and sorting them would drain an arbitrary slice of
+    a large backlog, newest first as often as not (CodeRabbit CR-03 on #13).
     """
     limit = SCAN_LIMIT if limit is None else limit
+    read = 0
+    more = False
     names: list[str] = []
-    capped = False
     with os.scandir(dir_fd) as it:
         for entry in it:
             if entry.name.startswith("."):
                 continue
-            if len(names) >= limit:
-                capped = True
+            if read >= SCAN_LIMIT:
+                more = True
                 break
+            read += 1
             names.append(entry.name)
-    names.sort()
-    return names, capped
+    if len(names) > limit:
+        more = True
+        names = heapq.nsmallest(limit, names)
+    else:
+        names.sort()
+    return names, more
 
 
 def read_and_validate_at(

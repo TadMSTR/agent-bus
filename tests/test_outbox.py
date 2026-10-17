@@ -817,3 +817,21 @@ def test_r3_01_a_stuck_valid_file_is_appended_once_however_long_it_stays(tmp_pat
     finally:
         a.chmod(0o700)
     assert [e["id"] for e in rec.appended].count(stuck_id) == 1
+
+
+def test_cr03_a_large_backlog_drains_oldest_first(tmp_path, monkeypatch):
+    """CodeRabbit CR-03 on #13: with a backlog larger than the per-cycle window, the
+    window must be the oldest names, not whatever scandir returned first."""
+    monkeypatch.setattr(ob, "SCAN_LIMIT", 1000)
+    root = tmp_path / "ob"
+    root.mkdir(mode=0o700)
+    names = [f"20260101T00{i:04d}.000000-{uuid.uuid4()}.json" for i in range(200)]
+    for n in reversed(names):  # newest created first, so directory order is not name order
+        _put(root, name=n)
+    fd = ob.open_root(root)
+    try:
+        got, more = ob.list_pending(fd, limit=10)
+    finally:
+        os.close(fd)
+    assert got == names[:10]
+    assert more is True
