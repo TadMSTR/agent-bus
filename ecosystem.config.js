@@ -38,6 +38,10 @@ module.exports = {
         AGENT_BUS_FEDERATION_INTERVAL: envVars.AGENT_BUS_FEDERATION_INTERVAL || '',
         AGENT_BUS_FEDERATION_MAX_EVENTS: envVars.AGENT_BUS_FEDERATION_MAX_EVENTS || '',
         AGENT_BUS_FEDERATION_MAX_SECONDS: envVars.AGENT_BUS_FEDERATION_MAX_SECONDS || '',
+        // Only this app drains outboxes. The stdio children the brokers spawn do not
+        // carry the variable, so they never contend for the drain lock.
+        AGENT_BUS_OUTBOXES: envVars.AGENT_BUS_OUTBOXES || '',
+        AGENT_BUS_OUTBOX_INTERVAL: envVars.AGENT_BUS_OUTBOX_INTERVAL || '',
       },
     },
     {
