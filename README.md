@@ -468,6 +468,26 @@ Every `AGENT_BUS_OUTBOX_INTERVAL` seconds, up to 500 files per cycle, in name or
 4. Append first, delete second. After a crash between the two, the restarted drainer finds
    the id in the last two days' log and deletes the file without appending it again.
 
+### The drainer is not steerable by its producer
+
+A producer can create anything inside its own root, and some producers can also write the
+root's parent: the task-queue-mcp container can, through its single bind mount. So every
+filesystem operation on a root is relative to one descriptor, opened with
+`O_DIRECTORY|O_NOFOLLOW` and checked to be a directory owned by the drainer's uid:
+- listing, stat, open, rename and unlink are all relative to that descriptor;
+- `.rejected` must be a real directory owned by the drainer, never a symlink;
+- `.reason` files are created `O_EXCL|O_NOFOLLOW`.
+
+A file that cannot be quarantined safely (`.rejected` unsafe, or full at 1000 entries) is
+removed instead. The entry itself is removed, never what a symlink points at, and the
+removal is logged as `outbox_dropped`. Directories are never removed. Each cycle reads at
+most 5000 entries per root, and `get_status` counts are capped the same way (`*_capped`).
+
+A file that raises anything unexpected is quarantined as `unreadable`, so it cannot stall
+its root or the roots after it. NaN/Infinity and metadata nested deeper than 16 levels are
+refused. If the chained log itself refuses an append, the cycle stops and every file stays
+for the next one.
+
 ### Health
 
 `get_status().outboxes` reports, per root, `pending`, `oldest_pending_age_s` and `rejected`,

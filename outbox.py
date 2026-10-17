@@ -56,6 +56,7 @@ This module is stdlib-only, like the client path, so a producer's test suite can
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -103,6 +104,10 @@ REASONS = (
     "bad_summary",
     "bad_metadata",
 )
+
+
+class _AppendFailed(Exception):
+    """The chained log refused an append: stop the cycle, delete nothing."""
 
 
 class OutboxRejection(ValueError):
@@ -211,40 +216,114 @@ def validate_event(obj: object, name: str, allowed_sources: frozenset[str] | set
     metadata = obj["metadata"]
     if not isinstance(metadata, dict):
         raise OutboxRejection("bad_metadata", "not an object")
+    if _depth(metadata) > MAX_METADATA_DEPTH:
+        raise OutboxRejection("bad_metadata", f"nested deeper than {MAX_METADATA_DEPTH}")
     if len(json.dumps(metadata, ensure_ascii=False).encode()) > MAX_METADATA_BYTES:
         raise OutboxRejection("bad_metadata", "over 4 KiB")
     return obj
 
 
-def read_and_validate(path: Path, allowed_sources: frozenset[str] | set[str]) -> dict:
-    """Read one outbox file without following a symlink, and validate it."""
+MAX_METADATA_DEPTH = 16
+# Bounds on what one cycle (and one get_status call) will look at, whatever a producer
+# puts in its root (audit F-03). The drain itself is bounded by max_per_cycle.
+SCAN_LIMIT = 5000
+REJECTED_LIMIT = 1000
+
+
+def _reject_constant(name: str) -> None:
+    # json.loads accepts NaN / Infinity by default; the chained log would then hold
+    # non-standard JSON (audit F-04).
+    raise ValueError(f"non-finite constant {name}")
+
+
+def _depth(obj: object) -> int:
+    """Nesting depth, iteratively, so a deep document cannot exhaust the stack here."""
+    deepest, stack = 0, [(obj, 1)]
+    while stack:
+        cur, d = stack.pop()
+        if isinstance(cur, dict | list):
+            deepest = max(deepest, d)
+            if d > MAX_METADATA_DEPTH:
+                return d
+            stack.extend((v, d + 1) for v in (cur.values() if isinstance(cur, dict) else cur))
+    return deepest
+
+
+def open_root(path: Path) -> int | None:
+    """Pin an outbox root: a directory, not a symlink, owned by this uid. None otherwise.
+
+    Every later operation on the root is relative to this descriptor (audit F-01, F-02).
+    A path that is re-resolved for each operation can be swapped for a symlink between
+    the check and the use, by any producer that can write the root's parent: the
+    task-queue-mcp container can write the parent of its own outbox.
+    """
     try:
-        st = path.lstat()
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        _log.error("outbox root %r cannot be opened as a real directory: %s", str(path), exc)
+        return None
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        os.close(fd)
+        _log.error("outbox root %r is not a directory owned by this uid", str(path))
+        return None
+    return fd
+
+
+def list_pending(dir_fd: int, limit: int | None = None) -> tuple[list[str], bool]:
+    """Pending entry names in name (= time) order, and whether the scan hit ``limit``.
+
+    Dot-entries are not pending. The scan stops at ``limit`` entries, so a flooded root
+    costs a bounded amount per cycle; past the limit, order is only within what was read.
+    """
+    limit = SCAN_LIMIT if limit is None else limit
+    names: list[str] = []
+    capped = False
+    with os.scandir(dir_fd) as it:
+        for entry in it:
+            if entry.name.startswith("."):
+                continue
+            if len(names) >= limit:
+                capped = True
+                break
+            names.append(entry.name)
+    names.sort()
+    return names, capped
+
+
+def read_and_validate_at(
+    dir_fd: int, name: str, allowed_sources: frozenset[str] | set[str]
+) -> dict:
+    """Read one outbox entry relative to its pinned root, without following a symlink."""
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     except OSError as exc:
         raise OutboxRejection("unreadable", exc.__class__.__name__) from None
     if not stat.S_ISREG(st.st_mode):
         raise OutboxRejection("not_regular_file")
     if st.st_uid != os.getuid():
         raise OutboxRejection("foreign_owner", f"uid {st.st_uid}")
-    if not NAME_RE.match(path.name):
-        raise OutboxRejection("bad_name", path.name[:80])
+    if not NAME_RE.match(name):
+        raise OutboxRejection("bad_name", name[:80])
     if st.st_size > MAX_FILE_BYTES:
         raise OutboxRejection("too_large", f"{st.st_size} bytes")
     try:
-        # The lstat above can be raced: the path can be swapped between it and this
+        # The stat above can be raced: the name can be swapped between it and this
         # open. O_NOFOLLOW refuses a swapped-in symlink. O_NONBLOCK stops a swapped-in
         # FIFO from blocking the open until a writer appears, which would hang the
         # drain thread and with it every root. The type and owner checks are then
         # repeated on the descriptor itself, which is what is actually read.
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     except OSError as exc:
         raise OutboxRejection("unreadable", exc.__class__.__name__) from None
     with os.fdopen(fd, "rb") as f:
         fst = os.fstat(f.fileno())
         if not stat.S_ISREG(fst.st_mode):
-            raise OutboxRejection("not_regular_file", "changed after lstat")
+            raise OutboxRejection("not_regular_file", "changed after stat")
         if fst.st_uid != os.getuid():
-            raise OutboxRejection("foreign_owner", f"uid {fst.st_uid}, changed after lstat")
+            raise OutboxRejection("foreign_owner", f"uid {fst.st_uid}, changed after stat")
         try:
             raw = f.read(MAX_FILE_BYTES + 1)
         except OSError as exc:
@@ -252,10 +331,22 @@ def read_and_validate(path: Path, allowed_sources: frozenset[str] | set[str]) ->
     if len(raw) > MAX_FILE_BYTES:
         raise OutboxRejection("too_large", "grew after stat")
     try:
-        obj = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+        obj = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise OutboxRejection("not_json") from None
-    return validate_event(obj, path.name, allowed_sources)
+    return validate_event(obj, name, allowed_sources)
+
+
+def read_and_validate(path: Path, allowed_sources: frozenset[str] | set[str]) -> dict:
+    """Path form of ``read_and_validate_at``, for producers' tests and one-off checks."""
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise OutboxRejection("unreadable", exc.__class__.__name__) from None
+    try:
+        return read_and_validate_at(dir_fd, path.name, allowed_sources)
+    finally:
+        os.close(dir_fd)
 
 
 def write_event(
@@ -293,33 +384,69 @@ def write_event(
 
 
 def pending_files(root: Path) -> list[Path]:
-    """Entries waiting in a root, in name (= time) order. Dot-entries are not pending."""
-    try:
-        return sorted(p for p in root.iterdir() if not p.name.startswith("."))
-    except OSError:
+    """Entries waiting in a root, in name order. Empty if the root is absent or unsafe."""
+    fd = open_root(root)
+    if fd is None:
         return []
+    try:
+        names, _ = list_pending(fd)
+        return [root / n for n in names]
+    finally:
+        os.close(fd)
+
+
+def _count_rejected(dir_fd: int, limit: int | None = None) -> tuple[int, bool]:
+    """Quarantined files under ``.rejected`` (not their ``.reason`` files), bounded."""
+    limit = SCAN_LIMIT if limit is None else limit
+    try:
+        rfd = os.open(REJECTED_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError:
+        return 0, False
+    try:
+        n = 0
+        with os.scandir(rfd) as it:
+            for entry in it:
+                if entry.name.endswith(".reason"):
+                    continue
+                n += 1
+                if n >= limit:
+                    return n, True
+        return n, False
+    finally:
+        os.close(rfd)
 
 
 def root_status(root: OutboxRoot, now: datetime | None = None) -> dict:
-    """Live counts for one root, read from disk so any process can report them."""
+    """Live counts for one root, read from disk so any process can report them.
+
+    Bounded (audit F-03): counts stop at SCAN_LIMIT and say so with ``*_capped``, because
+    every stdio child answers get_status and a flooded root must not make that expensive.
+    """
     now = now or datetime.now(timezone.utc)
     out: dict = {"path": str(root.path), "sources": sorted(root.sources)}
-    if not root.path.is_dir():
-        out.update(exists=False, pending=0, oldest_pending_age_s=None, rejected=0)
+    fd = open_root(root.path)
+    if fd is None:
+        out.update(exists=root.path.exists(), pending=0, oldest_pending_age_s=None, rejected=0)
         return out
-    pending = pending_files(root.path)
+    try:
+        names, capped = list_pending(fd)
+        rejected, rejected_capped = _count_rejected(fd)
+    finally:
+        os.close(fd)
     oldest = None
-    if pending:
-        m = NAME_RE.match(pending[0].name)
+    if names:
+        m = NAME_RE.match(names[0])
         if m:
             with_tz = datetime.strptime(m.group(1), "%Y%m%dT%H%M%S.%f").replace(tzinfo=timezone.utc)
             oldest = round((now - with_tz).total_seconds(), 1)
-    rej = root.path / REJECTED_DIR
-    try:
-        rejected = sum(1 for p in rej.iterdir() if not p.name.endswith(".reason"))
-    except OSError:
-        rejected = 0
-    out.update(exists=True, pending=len(pending), oldest_pending_age_s=oldest, rejected=rejected)
+    out.update(
+        exists=True,
+        pending=len(names),
+        pending_capped=capped,
+        oldest_pending_age_s=oldest,
+        rejected=rejected,
+        rejected_capped=rejected_capped,
+    )
     return out
 
 
@@ -343,6 +470,7 @@ class Drainer:
     drained: int = 0
     duplicates: int = 0
     rejected: int = 0
+    dropped: int = 0
     last_cycle: str | None = None
 
     def seed(self) -> None:
@@ -373,12 +501,62 @@ class Drainer:
         while len(self._seen) > self.seen_limit:
             self._seen.popitem(last=False)
 
-    def _reject(self, root: OutboxRoot, path: Path, exc: OutboxRejection) -> None:
-        self.rejected += 1
-        rej = root.path / REJECTED_DIR
+    def _drop(self, dir_fd: int, root: OutboxRoot, name: str, why: str) -> None:
+        """Remove an entry that cannot be quarantined safely. Logged, never silent.
+
+        unlink() of a name relative to the pinned root removes that entry itself, a
+        symlink included, and never what a symlink points at.
+        """
+        self.dropped += 1
         try:
-            rej.mkdir(mode=0o700, exist_ok=True)
-            os.rename(path, rej / path.name)
+            os.unlink(name, dir_fd=dir_fd)
+        except (IsADirectoryError, PermissionError):
+            # A directory is never removed recursively from here: left for a human.
+            _log.error(
+                "outbox_left_in_place root=%r file=%r why=%s (a directory)",
+                str(root.path),
+                name,
+                why,
+            )
+            return
+        except OSError as exc:
+            _log.error("outbox could not drop %r in %r: %s", name, str(root.path), exc)
+            return
+        _log.error("outbox_dropped root=%r file=%r why=%s", str(root.path), name, why)
+
+    def _quarantine_dir(self, dir_fd: int) -> int | None:
+        """Open ``.rejected`` under the pinned root, creating it if absent.
+
+        It must be a real directory owned by this uid. A producer can create anything
+        in its own root, including a ``.rejected`` symlink pointing anywhere the drainer
+        can write (audit F-01); that is refused, not followed.
+        """
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(REJECTED_DIR, 0o700, dir_fd=dir_fd)
+        try:
+            rfd = os.open(REJECTED_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        except OSError:
+            return None
+        st = os.fstat(rfd)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            os.close(rfd)
+            return None
+        return rfd
+
+    def _reject(self, dir_fd: int, root: OutboxRoot, name: str, exc: OutboxRejection) -> None:
+        self.rejected += 1
+        rfd = self._quarantine_dir(dir_fd)
+        if rfd is None:
+            self._drop(dir_fd, root, name, f"{exc.reason}; .rejected is not a safe directory")
+            return
+        try:
+            count, _ = _count_rejected(dir_fd, REJECTED_LIMIT)
+            if count >= REJECTED_LIMIT:
+                self._drop(dir_fd, root, name, f"{exc.reason}; quarantine full ({count})")
+                return
+            # rename() acts on the entry, not on what a symlink entry points at, and both
+            # ends are relative to descriptors that were checked.
+            os.rename(name, name, src_dir_fd=dir_fd, dst_dir_fd=rfd)
             reason_body = json.dumps(
                 {
                     "reason": exc.reason,
@@ -386,19 +564,30 @@ class Drainer:
                     "at": datetime.now(timezone.utc).isoformat(),
                 }
             )
-            # 0600 explicitly, not the umask: the detail quotes producer-written text.
-            fd = os.open(rej / f"{path.name}.reason", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            reason_name = f"{name}.reason"
+            # O_EXCL|O_NOFOLLOW: never truncate or write through an existing entry,
+            # symlink or not. A stale one is removed (the entry, not its target) first.
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(reason_name, dir_fd=rfd)
+            fd = os.open(
+                reason_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=rfd,
+            )
             with os.fdopen(fd, "w") as f:
                 f.write(reason_body + "\n")
         except OSError as move_exc:
-            _log.error("outbox could not quarantine %r (%s): %s", str(path), exc.reason, move_exc)
+            _log.error("outbox could not quarantine %r (%s): %s", name, exc.reason, move_exc)
             return
+        finally:
+            os.close(rfd)
         # %r, not %s: the file name and the detail are producer-written, and a newline in
         # either must not forge a second log line.
         _log.warning(
             "outbox_rejected root=%r file=%r reason=%s detail=%r",
             str(root.path),
-            path.name,
+            name,
             exc.reason,
             exc.detail,
         )
@@ -412,76 +601,92 @@ class Drainer:
         for root in self.roots:
             if budget <= 0:
                 break
+            dir_fd = open_root(root.path)
+            if dir_fd is None:
+                continue  # absent (status reports exists=False) or unsafe (logged)
             try:
-                rst = root.path.lstat()
-            except OSError:
-                continue  # not created yet; status reports exists=False
-            if not stat.S_ISDIR(rst.st_mode) or rst.st_uid != os.getuid():
-                _log.error("outbox root %s is not a directory owned by this uid", root.path)
-                continue
-            for path in pending_files(root.path)[:budget]:
-                budget -= 1
-                try:
-                    obj = read_and_validate(path, root.sources)
-                except OutboxRejection as exc:
-                    self._reject(root, path, exc)
-                    continue
-                if obj["id"] in self._seen:
-                    self.duplicates += 1
-                    # Logged, not silent (audit F-09): a duplicate is either a crash replay or
-                    # a producer reusing an id, and only the log can tell which.
-                    _log.warning(
-                        "outbox_duplicate root=%r file=%r id=%s source=%r",
-                        str(root.path),
-                        path.name,
-                        obj["id"],
-                        obj["source"],
-                    )
-                    self._unlink(path)
-                    continue
-                event = {
-                    "id": obj["id"],
-                    # Normalised to the +00:00 form every other writer uses:
-                    # query_events filters `since` by string comparison.
-                    "ts": parse_ts(obj["ts"]).astimezone(timezone.utc).isoformat(),
-                    "event": obj["event"],
-                    "scope": "cross-agent",
-                    "source": obj["source"],
-                    "target": obj["target"],
-                    "artifact_path": None,
-                    "summary": obj["summary"],
-                    "hostname": self.hostname,
-                    "metadata": obj["metadata"],
-                    "ingest": "outbox",
-                    "ingested_at": datetime.now(timezone.utc).isoformat(),
-                }
-                # Append first, delete second. A crash in between leaves the file, and
-                # seed() finds its id on restart. The reverse order would lose events.
-                self.append(event)
-                self._remember(obj["id"])
-                self._unlink(path)
-                appended += 1
-                self.drained += 1
-                try:
-                    self.fanout(event)
-                except Exception as exc:  # fan-out never undoes an append
-                    _log.warning("outbox fanout failed for %s: %s", obj["id"], exc)
+                n, budget = self._drain_root(dir_fd, root, budget)
+                appended += n
+            except _AppendFailed:
+                break  # the log itself is unwritable: stop, keep every file for later
+            finally:
+                os.close(dir_fd)
         self.last_cycle = datetime.now(timezone.utc).isoformat()
         return appended
 
+    def _drain_root(self, dir_fd: int, root: OutboxRoot, budget: int) -> tuple[int, int]:
+        appended = 0
+        names, _ = list_pending(dir_fd, limit=max(budget, 1) * 4)
+        for name in names[:budget]:
+            budget -= 1
+            try:
+                obj = read_and_validate_at(dir_fd, name, root.sources)
+            except OutboxRejection as exc:
+                self._reject(dir_fd, root, name, exc)
+                continue
+            except Exception as exc:  # any surprise is this file's problem (audit F-04)
+                self._reject(dir_fd, root, name, OutboxRejection("unreadable", type(exc).__name__))
+                continue
+            if obj["id"] in self._seen:
+                self.duplicates += 1
+                # Logged, not silent (audit F-09): a duplicate is either a crash replay or
+                # a producer reusing an id, and only the log can tell which.
+                _log.warning(
+                    "outbox_duplicate root=%r file=%r id=%s source=%r",
+                    str(root.path),
+                    name,
+                    obj["id"],
+                    obj["source"],
+                )
+                self._unlink(dir_fd, name)
+                continue
+            event = {
+                "id": obj["id"],
+                # Normalised to the +00:00 form every other writer uses:
+                # query_events filters `since` by string comparison.
+                "ts": parse_ts(obj["ts"]).astimezone(timezone.utc).isoformat(),
+                "event": obj["event"],
+                "scope": "cross-agent",
+                "source": obj["source"],
+                "target": obj["target"],
+                "artifact_path": None,
+                "summary": obj["summary"],
+                "hostname": self.hostname,
+                "metadata": obj["metadata"],
+                "ingest": "outbox",
+                "ingested_at": datetime.now(timezone.utc).isoformat(),
+            }
+            # Append first, delete second. A crash in between leaves the file, and
+            # seed() finds its id on restart. The reverse order would lose events.
+            try:
+                self.append(event)
+            except Exception as exc:
+                _log.error("outbox append failed, stopping this cycle: %s", exc)
+                raise _AppendFailed from exc
+            self._remember(obj["id"])
+            self._unlink(dir_fd, name)
+            appended += 1
+            self.drained += 1
+            try:
+                self.fanout(event)
+            except Exception as exc:  # fan-out never undoes an append
+                _log.warning("outbox fanout failed for %s: %s", obj["id"], exc)
+        return appended, budget
+
     @staticmethod
-    def _unlink(path: Path) -> None:
+    def _unlink(dir_fd: int, name: str) -> None:
         try:
-            path.unlink()
+            os.unlink(name, dir_fd=dir_fd)
         except FileNotFoundError:
             pass
         except OSError as exc:
-            _log.error("outbox could not delete ingested %s: %s", path, exc)
+            _log.error("outbox could not delete ingested %r: %s", name, exc)
 
     def stats(self) -> dict:
         return {
             "drained": self.drained,
             "duplicates": self.duplicates,
             "rejected": self.rejected,
+            "dropped": self.dropped,
             "last_cycle": self.last_cycle,
         }

@@ -485,23 +485,28 @@ def test_a_trailing_z_is_accepted_on_every_python(tmp_path, ts):
 
 
 def test_a_fifo_swapped_in_after_lstat_does_not_block(tmp_path, monkeypatch):
-    """The race: lstat sees a regular file, the open meets a FIFO."""
+    """The race: the stat sees a regular file, the open meets a FIFO.
+
+    Hooked at os.stat (the drainer stats relative to the pinned root, not by Path) so the
+    swap lands exactly in the window between the check and the open.
+    """
     root = tmp_path / "ob"
     p = _put(root)
-    real_lstat = Path.lstat
+    real_stat = os.stat
     seen = {}
 
-    def lstat_then_swap(self):
-        st = real_lstat(self)
-        if self == p and not seen:
+    def stat_then_swap(name, *a, **kw):
+        st = real_stat(name, *a, **kw)
+        if name == p.name and kw.get("dir_fd") is not None and not seen:
             seen["done"] = True
-            self.unlink()
-            os.mkfifo(self)
+            os.unlink(name, dir_fd=kw["dir_fd"])
+            os.mkfifo(name, dir_fd=kw["dir_fd"])
         return st
 
-    monkeypatch.setattr(Path, "lstat", lstat_then_swap)
+    monkeypatch.setattr(ob.os, "stat", stat_then_swap)
     with pytest.raises(ob.OutboxRejection) as ei:
         ob.read_and_validate(p, {SRC})
+    assert seen, "the swap never ran: the test exercised nothing"
     assert ei.value.reason == "not_regular_file"
 
 
@@ -517,3 +522,173 @@ def test_reason_file_is_0600_and_the_log_line_cannot_be_split(tmp_path, caplog):
 def test_heartbeat_file_is_0600(served, comms_dir):
     ab.write_outbox_status()
     assert oct((comms_dir / "outbox-status.json").stat().st_mode & 0o777) == "0o600"
+
+
+# ── audit 2026-10-16 F-01..F-04: the drainer must not be steerable by its producer ──
+
+
+def test_f01_a_symlinked_rejected_dir_is_not_followed(tmp_path):
+    """Security's reproduction (a): `.rejected -> victim/` plus a pending file named
+    `authorized_keys` overwrote victim/authorized_keys."""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "authorized_keys").write_text("ORIGINAL\n")
+    root = tmp_path / "ob"
+    root.mkdir(mode=0o700)
+    (root / ob.REJECTED_DIR).symlink_to(victim)
+    (root / "authorized_keys").write_text("ssh-ed25519 ATTACKER\n")
+    d, rec = _drainer(root, tmp_path / "logs")
+    d.drain_once()
+    assert (victim / "authorized_keys").read_text() == "ORIGINAL\n"
+    assert not (victim / "authorized_keys.reason").exists()
+    assert rec.appended == []
+    assert d.stats()["dropped"] == 1
+    assert not (root / "authorized_keys").exists()
+
+
+def test_f01_a_planted_reason_symlink_is_not_written_through(tmp_path):
+    """Security's reproduction (b): a `.reason` symlink to a shell rc file, plus a file
+    whose name carries a command substitution, produced a poisoned rc file."""
+    rc = tmp_path / "bashrc"
+    rc.write_text("ORIGINAL\n")
+    root = tmp_path / "ob"
+    rej = root / ob.REJECTED_DIR
+    rej.mkdir(parents=True, mode=0o700)
+    name = "$(id>PWNED)"
+    (rej / f"{name}.reason").symlink_to(rc)
+    (root / name).write_text("x")
+    d, _ = _drainer(root, tmp_path / "logs")
+    d.drain_once()
+    assert rc.read_text() == "ORIGINAL\n"
+    reason = rej / f"{name}.reason"
+    assert not reason.is_symlink()
+    assert json.loads(reason.read_text())["reason"] == "bad_name"
+
+
+def test_f02_a_root_that_is_a_symlink_is_not_drained(tmp_path):
+    """The root swapped for a symlink (to ~/.ssh, say): refused, nothing moved."""
+    target = tmp_path / "ssh"
+    target.mkdir()
+    (target / "id_ed25519").write_text("KEY\n")
+    root = tmp_path / "ob"
+    root.symlink_to(target)
+    d, _ = _drainer(root, tmp_path / "logs")
+    assert d.drain_once() == 0
+    assert (target / "id_ed25519").read_text() == "KEY\n"
+    assert not (target / ob.REJECTED_DIR).exists()
+    assert ob.pending_files(root) == []
+
+
+def test_f02_status_does_not_follow_a_symlinked_root(tmp_path):
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (target / "x").write_text("x")
+    root = tmp_path / "ob"
+    root.symlink_to(target)
+    st = ob.root_status(ob.OutboxRoot(root, frozenset({SRC})))
+    assert st["pending"] == 0
+
+
+def test_f01_a_rejected_dir_owned_by_someone_else_is_not_used(tmp_path, monkeypatch):
+    root = tmp_path / "ob"
+    root.mkdir(mode=0o700)
+    (root / ob.REJECTED_DIR).mkdir()
+    p = _put(root, name="nonsense.json")
+    real_fstat = os.fstat
+    rej_ino = (root / ob.REJECTED_DIR).stat().st_ino
+
+    def fstat(fd):
+        st = real_fstat(fd)
+        if st.st_ino == rej_ino:
+            fake = list(st)
+            fake[4] = st.st_uid + 1  # st_uid
+            return os.stat_result(fake)
+        return st
+
+    monkeypatch.setattr(ob.os, "fstat", fstat)
+    d, _ = _drainer(root, tmp_path / "logs")
+    d.drain_once()
+    assert not p.exists()
+    assert list((root / ob.REJECTED_DIR).iterdir()) == []
+    assert d.stats()["dropped"] == 1
+
+
+def test_f03_quarantine_is_capped(tmp_path, monkeypatch):
+    monkeypatch.setattr(ob, "REJECTED_LIMIT", 3)
+    root = tmp_path / "ob"
+    for i in range(5):
+        _put(root, name=f"bad-{i}.json")
+    d, _ = _drainer(root, tmp_path / "logs")
+    d.drain_once()
+    kept = [p for p in (root / ob.REJECTED_DIR).iterdir() if not p.name.endswith(".reason")]
+    assert len(kept) == 3
+    assert d.stats()["dropped"] == 2
+    assert ob.pending_files(root) == []
+
+
+def test_f03_scan_and_status_are_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(ob, "SCAN_LIMIT", 4)
+    root = tmp_path / "ob"
+    for _ in range(9):
+        _put(root)
+    st = ob.root_status(ob.OutboxRoot(root, frozenset({SRC})))
+    assert st["pending"] == 4 and st["pending_capped"] is True
+
+
+def test_f04_an_unexpected_error_quarantines_that_file_and_the_next_one_drains(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "ob"
+    first = _put(root, name=f"20200101T000000.000000-{uuid.uuid4()}.json")
+    _put(root, name=f"20200101T000001.000000-{uuid.uuid4()}.json")
+    real = ob.validate_event
+    calls = {"n": 0}
+
+    def flaky(obj, name, sources):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("surprise")
+        return real(obj, name, sources)
+
+    monkeypatch.setattr(ob, "validate_event", flaky)
+    d, rec = _drainer(root, tmp_path / "logs")
+    assert d.drain_once() == 1
+    assert len(rec.appended) == 1
+    reason = json.loads((root / ob.REJECTED_DIR / f"{first.name}.reason").read_text())
+    assert reason == reason | {"reason": "unreadable", "detail": "RuntimeError"}
+
+
+def test_f04_non_finite_constants_are_refused(tmp_path):
+    name, eid = _name()
+    raw = json.dumps(_body(eid)).replace('"schema": 1', '"schema": NaN').encode()
+    p = _put(tmp_path / "ob", name=name, raw=raw)
+    with pytest.raises(ob.OutboxRejection) as ei:
+        ob.read_and_validate(p, {SRC})
+    assert ei.value.reason == "not_json"
+
+
+def test_f04_deep_metadata_is_refused_without_recursing(tmp_path):
+    deep: dict = {}
+    cur = deep
+    for _ in range(40):
+        cur["k"] = {}
+        cur = cur["k"]
+    p = _put(tmp_path / "ob", body=lambda e: _body(e, metadata=deep))
+    with pytest.raises(ob.OutboxRejection) as ei:
+        ob.read_and_validate(p, {SRC})
+    assert ei.value.reason == "bad_metadata"
+
+
+def test_f04_an_unwritable_log_stops_the_cycle_and_keeps_the_files(tmp_path):
+    root = tmp_path / "ob"
+    a = _put(root)
+    b = _put(root)
+    d, _ = _drainer(root, tmp_path / "logs")
+
+    def boom(e):
+        raise OSError("disk full")
+
+    d.append = boom
+    assert d.drain_once() == 0
+    assert a.exists() and b.exists()
+    assert not (root / ob.REJECTED_DIR).exists()

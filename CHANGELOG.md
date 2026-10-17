@@ -26,6 +26,15 @@ Lifecycle events emitted by their owners. Build plan
   `hitl.requested`, `hitl.approved`, `hitl.refused`, `hitl.closed`, `build.step`,
   `coderabbit.state`. `task.dead-lettered` is high-priority.
 
+### Security
+
+- The drainer works relative to a pinned descriptor per root, so a producer cannot steer
+  it outside its root: no symlinked `.rejected` or `.reason`, and no swapped root
+  (security audit F-01 High, F-02 Medium; reproduced, then fixed with tests that fail
+  before the fix). Listing, status and quarantine are bounded (F-03). One malformed file
+  can no longer stall a root, and NaN/Infinity and deep nesting are refused (F-04).
+  Duplicate ids are logged (F-09).
+
 ### Deprecated
 
 - `task.dispatched` has no emitter after this release's producers ship. It stays
