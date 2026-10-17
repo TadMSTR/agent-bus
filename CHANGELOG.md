@@ -42,6 +42,17 @@ Lifecycle events emitted by their owners. Build plan
     (R2-02).
   - The quarantine is counted once per root per cycle, and drops are reported per root
     (R2-03).
+- Security re-check round 3:
+  - A valid file that was appended but could not be deleted (for example, a read-only
+    root) is never appended twice. Its id is pinned until the file is gone, instead of
+    relying on the recent-id window, which it could age out of or lose on a restart
+    (R3-01, Info).
+
+### Fixed
+
+- A bounded scan drains the oldest outbox files first. It used to sort only the entries
+  the directory listing returned first, so a backlog larger than the window could drain
+  in arbitrary order (CodeRabbit CR-03).
 
 ### Deprecated
 
