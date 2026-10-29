@@ -250,7 +250,7 @@ def test_vocabulary_is_immutable():
 
 
 def test_workspace_edit_denied_is_declared_cross_agent():
-    """workspace-policy-hook.py emits it with scope='cross-agent'; the log-only triage reads it there."""
+    """workspace-policy-hook.py emits it cross-agent; the log-only triage reads it there."""
     assert "workspace.edit_denied" in event_vocab.CROSS_AGENT_EVENTS
     assert "workspace.edit_denied" not in event_vocab.SESSION_EVENTS
     assert event_vocab.unknown_event_reason("workspace.edit_denied", "enforce") is None
