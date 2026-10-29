@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Vocabulary: `workspace.edit_denied`, emitted by host-forge-scripts'
+  `workspace-policy-hook.py` for every agent file edit the workspace policy refuses or,
+  in log-only mode, would refuse. Cross-agent.
+
 ## [0.5.0] — 2026-10-16
 
 Lifecycle events emitted by their owners. Build plan

@@ -127,6 +127,10 @@ CROSS_AGENT_EVENTS = frozenset(
         "update.cycle.completed",  # host-forge-runbooks/update-cycle.md
         "compact_qc.complete",  # ~/scripts/memory-compact-qc.sh
         "rollover_qc.complete",  # ~/scripts/harlock-rollover-qc.sh
+        # host-forge-scripts workspace-policy-hook.py: an agent file edit the workspace
+        # policy refused (metadata.mode "enforce") or would refuse ("log"). Cross-agent
+        # on purpose: the 48 h log-only window is triaged from these.
+        "workspace.edit_denied",
     }
 )
 
