@@ -51,7 +51,7 @@ jobs:
 
   # The newest versions pyproject.toml allows, not the lock. The lock is what
   # ships, so every other job tests it; this one exists because a pin alone hides a
-  # forward-compatibility break until the day someone re-resolves (#611).
+  # forward-compatibility break until the day someone re-resolves.
   #
   # GATING, deliberately. fastmcp and mcp are capped below their next major, so
   # anything that breaks here is a release a fresh install could pick up today. A
