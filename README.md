@@ -69,12 +69,51 @@ graph TB
 
 ## Installation
 
+agent-bus is not published to PyPI, and the server is not installed as a package at all: PM2
+runs `server.py` from the checkout with `venv/bin/python3`. The venv holds only the server's
+dependencies, installed from the committed `uv.lock` so the set is the one CI tested and
+audited. Install from a checkout of a release tag, with [uv](https://docs.astral.sh/uv/):
+
 ```bash
-git clone https://github.com/TadMSTR/agent-bus ~/repos/agent-bus
-cd ~/repos/agent-bus
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt
+VERSION=0.6.0
+REPO=~/repos/agent-bus
+git clone https://github.com/TadMSTR/agent-bus "$REPO"
+cd "$REPO"
+git checkout "v$VERSION"
+
+# 1. The checkout is clean and is exactly the release tag on the remote. A local tag
+#    can be moved, and a dirty tree would run as it stands: the checkout IS the
+#    deployed code.
+git fetch --tags origin
+test -z "$(git status --porcelain)"
+# The peeled line (^{}) is listed last for an annotated tag; a lightweight tag has one line.
+test "$(git rev-parse HEAD)" = \
+  "$(git ls-remote origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail -n1 | cut -f1)"
+
+# 2. Build a fresh venv at the path the service runs from. Pin the interpreter: uv
+#    otherwise prefers a Python it manages itself, which `uv python` can later remove
+#    or replace under a running service. --no-install-project installs the [server]
+#    dependencies and not agent-bus itself: the service runs from the source tree, and
+#    an installed copy would sit unused in site-packages and misreport the version.
+UV_PROJECT_ENVIRONMENT="$REPO/venv" \
+  uv sync --frozen --no-install-project --extra server --python /usr/bin/python3.13
+
+# 3. Confirm what was installed: the modules import from the checkout, and the
+#    dependency versions are the locked ones.
+venv/bin/python3 -c "import server, reconcile, outbox, nats_publisher"
+venv/bin/python3 -c "import importlib.metadata as m; [print(p, m.version(p)) for p in ('fastmcp', 'mcp', 'cryptography', 'nats-py')]"
 ```
+
+Build a fresh venv rather than installing into an existing one: an install into an existing
+venv keeps whatever older dependency versions it finds there, if they still satisfy the
+declared ranges. Build at the final path rather than building elsewhere and moving it: the
+venv's scripts embed its path. A uv-built venv has no `pip`. Stop the service before
+replacing its venv, and restart it after step 3. Every MCP client that spawns `server.py`
+over stdio uses the same venv, so restart those clients too.
+
+CI audits the locked set on every push and weekly, but nothing reads a scheduled run's
+result unless you watch it. Audit the deployed venv where it runs as well (for example
+`pip-audit --path venv/lib/python3.13/site-packages`).
 
 Register with PM2:
 
@@ -514,7 +553,8 @@ from a bus event.** Approvals come from scoped-mcp's pending record and its sign
 ## Requirements
 
 - Python 3.11+
-- `fastmcp>=3.2.4`
+- Server dependencies: the `server` extra in `pyproject.toml`, pinned by `uv.lock`
+- `fastmcp`
 - `cryptography` — ed25519 signature verification
 - `nats-py` — NATS federation publishing (optional at runtime: publishing is skipped if
   `NATS_AGENT_BUS_PASSWORD` is unset, but the package is a real install-time dependency)

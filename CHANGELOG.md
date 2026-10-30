@@ -2,13 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.6.0] — 2026-10-30
+
+Locked dependencies. The deployed venv is built from `uv.lock`.
 
 ### Added
 
 - Vocabulary: `workspace.edit_denied`, emitted by host-forge-scripts'
   `workspace-policy-hook.py` for every agent file edit the workspace policy refuses or,
   in log-only mode, would refuse. Cross-agent.
+- `uv.lock`, committed. It is the server's dependency contract: the deploy builds a fresh
+  venv with `uv sync --frozen --no-install-project --extra server --python
+  /usr/bin/python3.13` (README "Installation").
+
+### Changed
+
+- **`requirements.txt` is deleted.** It was the PM2 service's install contract and the
+  `server` extra mirrored it by hand. The lock replaces both roles.
+- `requires-python` is `>=3.11`, matching the CI matrix and both client consumers. With
+  3.10 allowed, the lock carried a second resolution that a 3.13 audit never saw.
+- Security floors in the `server` extra: `fastmcp>=3.4.10`, `mcp>=1.30`,
+  `cryptography>=50.0`, `anyio>=4.14.2`, `opentelemetry-api>=1.45.1`, `starlette>=1.3.1`,
+  `python-multipart>=0.0.31`, `h11>=0.16.0`, `pyjwt>=2.15.0`. The pyproject comment names
+  the packages held only by the lock.
+- `build-system.requires` pins `setuptools==84.2.1`; the lock does not cover build
+  dependencies.
+- CI installs from the lock (`uv sync --frozen`), audits the locked runtime and dev sets
+  with a pinned pip-audit, runs `uv lock --check`, and adds a gating `latest` job that
+  tests the newest allowed versions, on every push and weekly. The bare-wheel check is
+  unchanged; the server-extra import check now installs the locked set. Actions moved to
+  `actions/checkout` v7.0.1 and `actions/setup-python` v7.0.0, pinned by SHA, with
+  `persist-credentials: false` everywhere, including the release job that holds
+  `contents: write`.
+- `.gitignore` covers `.env.*` (keeping `.env.example`) and matches core dumps as
+  `core.[0-9]*` rather than `core.*`.
+
+### Notes
+
+- v0.6.0 is the first locked release. task-dispatcher and task-queue-mcp pin agent-bus by
+  commit (`41c1ade`) for the client path, which has no dependencies, and are unaffected.
 
 ## [0.5.0] — 2026-10-16
 

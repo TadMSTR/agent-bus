@@ -128,9 +128,12 @@ ntfy and webhook delivery shell out to `curl`; there is no HTTP client dependenc
 ## Testing
 
 ```bash
-pip install -e ".[dev]"
-pytest
+uv sync --frozen --extra dev --extra server
+.venv/bin/python -m pytest
 ```
+
+`uv.lock` is the dependency contract. After changing `pyproject.toml`, run `uv lock` and
+commit both; CI fails on `uv lock --check` otherwise.
 
 Unit tests use fixtures in `tests/`. No external NATS server is required — the publisher
 is stubbed, and the connection path is exercised against a fake `nats` module.
