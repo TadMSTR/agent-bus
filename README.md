@@ -69,12 +69,76 @@ graph TB
 
 ## Installation
 
+agent-bus is not published to PyPI, and the server is not installed as a package at all: PM2
+runs `server.py` from the checkout with `venv/bin/python3`. The venv holds only the server's
+dependencies, installed from the committed `uv.lock` so the set is the one CI tested and
+audited. Install from a checkout of a release tag, with [uv](https://docs.astral.sh/uv/).
+
+Save this as a script and run it with `bash`. Don't paste it into a shell: every check ends
+the run on failure, and that only works under `set -e` in a script.
+
 ```bash
-git clone https://github.com/TadMSTR/agent-bus ~/repos/agent-bus
-cd ~/repos/agent-bus
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt
+#!/usr/bin/env bash
+set -euo pipefail
+VERSION=0.6.0
+REPO=~/repos/agent-bus
+PY=/usr/bin/python3.13
+die() { echo "install: $*" >&2; exit 1; }
+
+[ -d "$REPO/.git" ] || git clone https://github.com/TadMSTR/agent-bus "$REPO"
+cd "$REPO" || die "cannot enter $REPO"
+git fetch --tags origin
+git checkout --quiet "v$VERSION"
+
+# 1. The checkout is exactly the release tag on the remote, and nothing else. The
+#    checkout IS the deployed code, so this is the code check. Python loads an imported
+#    module from __pycache__ whenever the cached header's source mtime and size match,
+#    and `git status` does not show ignored files: bytecode left in the tree would run in
+#    place of the source and pass a plain clean-tree test. Remove it and the tool caches,
+#    then refuse anything left except the venv and .env files.
+find . -path ./venv -prune -o \( -name __pycache__ -o -name '*.py[co]' \) -print0 \
+  | xargs -0 -r rm -rf --
+rm -rf .pytest_cache .ruff_cache .coverage htmlcov build dist ./*.egg-info
+status=$(git status --porcelain --ignored)
+extra=$(printf '%s\n' "$status" | grep -vxE '(!! (venv/|\.env|\.env\.[^/]+))?' || true)
+[ -z "$extra" ] || die "checkout holds more than v$VERSION; remove these first:
+$extra"
+# The peeled line (^{}) is listed last for an annotated tag; a lightweight tag has one line.
+tag=$(git ls-remote origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail -n1 | cut -f1)
+[ -n "$tag" ] || die "tag v$VERSION is not on origin"
+[ "$(git rev-parse HEAD)" = "$tag" ] || die "HEAD is not origin's v$VERSION ($tag)"
+
+# 2. Build a fresh venv at the path the service runs from. Stop the service and move
+#    the old venv aside first; this refuses to build over one. Pin the interpreter: uv
+#    otherwise prefers a Python it manages itself, which `uv python` can later remove or
+#    replace under a running service. --no-install-project installs the [server]
+#    dependencies and not agent-bus itself: the service runs from the source tree, and an
+#    installed copy would sit unused in site-packages and misreport the version.
+[ ! -e venv ] || die "venv/ exists: stop the service and move it aside first"
+UV_PROJECT_ENVIRONMENT="$REPO/venv" \
+  uv sync --frozen --no-install-project --extra server --python "$PY"
+
+# 3. The venv is exactly the lock (no missing, extra or different package), and the
+#    modules import from the checkout.
+UV_PROJECT_ENVIRONMENT="$REPO/venv" \
+  uv sync --frozen --no-install-project --extra server --python "$PY" --check \
+  || die "venv does not match uv.lock"
+venv/bin/python3 -c "import server, reconcile, outbox, nats_publisher" \
+  || die "server modules do not import"
+echo "install: agent-bus v$VERSION ready; restart the service and its stdio clients"
 ```
+
+Build a fresh venv rather than installing into an existing one: an install into an existing
+venv keeps whatever older dependency versions it finds there, if they still satisfy the
+declared ranges. Build at the final path rather than building elsewhere and moving it: the
+venv's scripts embed its path. A uv-built venv has no `pip`. Stop the service before
+replacing its venv, and restart it after step 3. Every MCP client that spawns `server.py`
+over stdio uses the same venv, so restart those clients too.
+
+CI audits the locked set on every push and weekly, but nothing reads a scheduled run's
+result unless you watch it, and GitHub disables a public repository's scheduled workflows
+after 60 days without activity. Audit the deployed venv where it runs as well (for example
+`pip-audit --path venv/lib/python3.13/site-packages`).
 
 Register with PM2:
 
@@ -514,7 +578,8 @@ from a bus event.** Approvals come from scoped-mcp's pending record and its sign
 ## Requirements
 
 - Python 3.11+
-- `fastmcp>=3.2.4`
+- Server dependencies: the `server` extra in `pyproject.toml`, pinned by `uv.lock`
+- `fastmcp`
 - `cryptography` — ed25519 signature verification
 - `nats-py` — NATS federation publishing (optional at runtime: publishing is skipped if
   `NATS_AGENT_BUS_PASSWORD` is unset, but the package is a real install-time dependency)

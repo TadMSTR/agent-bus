@@ -1,8 +1,8 @@
 [project]
 name = "agent-bus"
-version = "0.5.0"
+version = "0.6.0"
 description = "Inter-agent event bus with hash-chained JSONL logs and NATS federation"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 # EMPTY ON PURPOSE. The client path — agent_bus_client -> event_log -> event_vocab — is
 # stdlib-only, and it is the path non-MCP callers install (see the `client` extra below).
 # Hard-requiring the server's three dependencies made `pip install agent-bus` pull fastmcp,
@@ -11,18 +11,43 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-# THE LIVE SERVER DOES NOT INSTALL FROM HERE. requirements.txt is the PM2 service's real
-# contract: ecosystem.config.js runs server.py from this source tree with venv/bin/python3,
-# and agent-bus is not installed as a distribution in its own venv at all. This extra
-# mirrors requirements.txt for anyone who does `pip install agent-bus[server]` — the two
-# files are intentionally separate and MUST be kept in step by hand. If the deploy is ever
-# switched to `pip install .`, delete requirements.txt in the same change rather than
-# leaving two contracts; an undocumented divergence here is how someone ends up with a
-# server that has no dependencies.
+# WHAT THE LIVE SERVER RUNS. ecosystem.config.js runs server.py from this source tree with
+# venv/bin/python3, and agent-bus is not installed as a distribution in its own venv. The
+# venv is built from uv.lock with this extra and nothing else:
+#     uv sync --frozen --no-install-project --extra server --python /usr/bin/python3.13
+# uv.lock is the contract; requirements.txt was deleted in v0.6.0 when the deploy moved
+# off it. See README "Installation".
 server = [
-    "fastmcp>=3.2.4,<4",
-    "cryptography>=41.0",
+    # Capped below 4: 4.x is a major this server has never run on. uv.lock pins what is
+    # tested and deployed; the CI `latest` job resolves the newest versions these ranges
+    # allow, so a forward-compat break shows up there rather than at the next deploy.
+    "fastmcp>=3.4.10,<4",
+    # Imported directly: _verify_signature checks every signed event's Ed25519 signature.
+    "cryptography>=50.0",
     "nats-py>=2.6",
+    # Security floors on transitive deps. None is imported here directly; each is declared
+    # only to hold its floor. uv.lock is the control: it pins every package, and a deploy
+    # builds a fresh venv from it. These floors are the second line, for an install that
+    # re-resolves into an existing venv and would otherwise keep an old version it finds.
+    #
+    # Scope, checked 2026-10-30 against every published advisory for every package in the
+    # locked [server] set. The server speaks stdio only (mcp.run() with no transport), so a
+    # request reaches mcp's stdio server (anyio), fastmcp's dispatch and its trace-context
+    # parse (opentelemetry-api), cryptography and nats-py. The HTTP transport (starlette,
+    # python-multipart, h11) and mcp's auth layer (pyjwt) are imported but not served;
+    # they are floored anyway, because a re-resolve should not hand a later HTTP transport
+    # an old version. Packages whose declared range still admits an advisory and that no
+    # request reaches are held only by the lock: authlib, certifi, dnspython, idna,
+    # jaraco-context, joserfc, pydantic-settings, pygments, python-dotenv.
+    # Capped below 2 with fastmcp's own range.
+    "mcp>=1.30,<2",
+    "anyio>=4.14.2",
+    # fastmcp extracts the caller's traceparent/tracestate from every tool call's _meta.
+    "opentelemetry-api>=1.45.1",
+    "starlette>=1.3.1",
+    "python-multipart>=0.0.31",
+    "h11>=0.16.0",
+    "pyjwt>=2.15.0",
 ]
 # Named for symmetry and for callers to depend on explicitly. It is empty because the
 # client genuinely needs nothing; tests/test_client_is_dependency_free.py is what keeps
@@ -37,7 +62,9 @@ dev = [
 ]
 
 [build-system]
-requires = ["setuptools>=68"]
+# Pinned: uv.lock does not lock build dependencies, so a wheel build would otherwise
+# resolve whatever setuptools is newest. Move it with a `uv lock` refresh.
+requires = ["setuptools==84.2.1"]
 build-backend = "setuptools.build_meta"
 
 # Flat layout (accepted deviation from the src/<pkg>/ standard — see CHANGELOG).

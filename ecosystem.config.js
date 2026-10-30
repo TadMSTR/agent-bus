@@ -18,6 +18,8 @@ module.exports = {
     {
       name: 'agent-bus',
       script: 'server.py',
+      // venv/ is built from uv.lock: see README "Installation". Restart by name
+      // (`pm2 restart agent-bus`); the reconcile and cleanup entries below run from cron.
       interpreter: path.join(__dirname, 'venv/bin/python3'),
       cwd: __dirname,
       autorestart: true,

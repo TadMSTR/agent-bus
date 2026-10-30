@@ -170,8 +170,9 @@ def parse_ts(ts: object) -> datetime | None:
     """Parse a contract ``ts``, or None. Timezone-aware results only.
 
     A trailing ``Z`` is normalised to ``+00:00`` first: ``datetime.fromisoformat``
-    accepts it from Python 3.11 but not on 3.10, which this package still supports, and
-    a contract whose answer depends on the drainer's Python version is two contracts.
+    accepts it only from Python 3.11, and a contract whose answer depends on the
+    drainer's Python version is two contracts. 3.11 has been the floor since v0.6.0;
+    the normalisation stays so the contract does not lean on that.
     """
     if not isinstance(ts, str):
         return None
