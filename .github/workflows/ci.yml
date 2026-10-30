@@ -117,6 +117,10 @@ jobs:
             --format pylock.toml -o .audit-dev/pylock.toml
       # Separate directories, so `--locked` cannot merge the two. pip-audit is pinned.
       # No --ignore-vuln without a dated, ticket-referenced reason next to it.
+      # SECURITY[accepted]: pip-audit's own dependencies resolve fresh on each run, so a
+      # bad release of one could flip the verdict. This job holds contents: read, no
+      # token in .git/config and no secrets: the worst case is a wrong verdict, not a
+      # compromise. Audit: 2026-10-30/venv-advisories-2026-10-p4 (F-04).
       - name: Audit runtime dependencies
         run: uv tool run --from "pip-audit==2.10.1" pip-audit --strict --locked .audit-runtime
       - name: Audit dev dependencies
