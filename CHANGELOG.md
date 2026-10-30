@@ -34,6 +34,10 @@ Locked dependencies. The deployed venv is built from `uv.lock`.
   `actions/checkout` v7.0.1 and `actions/setup-python` v7.0.0, pinned by SHA, with
   `persist-credentials: false` everywhere, including the release job that holds
   `contents: write`.
+- README "Installation" is a script that stops on the first failed check. It removes
+  bytecode and tool caches from the checkout, then refuses anything left besides the venv
+  and `.env` files, because the service runs from the checkout and ignored files are not in
+  a plain `git status`. It confirms the venv matches the lock with `uv sync --check`.
 - `.gitignore` covers `.env.*` (keeping `.env.example`) and matches core dumps as
   `core.[0-9]*` rather than `core.*`.
 

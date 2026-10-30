@@ -72,36 +72,60 @@ graph TB
 agent-bus is not published to PyPI, and the server is not installed as a package at all: PM2
 runs `server.py` from the checkout with `venv/bin/python3`. The venv holds only the server's
 dependencies, installed from the committed `uv.lock` so the set is the one CI tested and
-audited. Install from a checkout of a release tag, with [uv](https://docs.astral.sh/uv/):
+audited. Install from a checkout of a release tag, with [uv](https://docs.astral.sh/uv/).
+
+Save this as a script and run it with `bash`. Don't paste it into a shell: every check ends
+the run on failure, and that only works under `set -e` in a script.
 
 ```bash
+#!/usr/bin/env bash
+set -euo pipefail
 VERSION=0.6.0
 REPO=~/repos/agent-bus
-git clone https://github.com/TadMSTR/agent-bus "$REPO"
-cd "$REPO"
-git checkout "v$VERSION"
+PY=/usr/bin/python3.13
+die() { echo "install: $*" >&2; exit 1; }
 
-# 1. The checkout is clean and is exactly the release tag on the remote. A local tag
-#    can be moved, and a dirty tree would run as it stands: the checkout IS the
-#    deployed code.
+[ -d "$REPO/.git" ] || git clone https://github.com/TadMSTR/agent-bus "$REPO"
+cd "$REPO" || die "cannot enter $REPO"
 git fetch --tags origin
-test -z "$(git status --porcelain)"
+git checkout --quiet "v$VERSION"
+
+# 1. The checkout is exactly the release tag on the remote, and nothing else. The
+#    checkout IS the deployed code, so this is the code check. Python loads an imported
+#    module from __pycache__ whenever the cached header's source mtime and size match,
+#    and `git status` does not show ignored files: bytecode left in the tree would run in
+#    place of the source and pass a plain clean-tree test. Remove it and the tool caches,
+#    then refuse anything left except the venv and .env files.
+find . -path ./venv -prune -o \( -name __pycache__ -o -name '*.py[co]' \) -print0 \
+  | xargs -0 -r rm -rf --
+rm -rf .pytest_cache .ruff_cache .coverage htmlcov build dist ./*.egg-info
+status=$(git status --porcelain --ignored)
+extra=$(printf '%s\n' "$status" | grep -vxE '(!! (venv/|\.env|\.env\.[^/]+))?' || true)
+[ -z "$extra" ] || die "checkout holds more than v$VERSION; remove these first:
+$extra"
 # The peeled line (^{}) is listed last for an annotated tag; a lightweight tag has one line.
-test "$(git rev-parse HEAD)" = \
-  "$(git ls-remote origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail -n1 | cut -f1)"
+tag=$(git ls-remote origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail -n1 | cut -f1)
+[ -n "$tag" ] || die "tag v$VERSION is not on origin"
+[ "$(git rev-parse HEAD)" = "$tag" ] || die "HEAD is not origin's v$VERSION ($tag)"
 
-# 2. Build a fresh venv at the path the service runs from. Pin the interpreter: uv
-#    otherwise prefers a Python it manages itself, which `uv python` can later remove
-#    or replace under a running service. --no-install-project installs the [server]
-#    dependencies and not agent-bus itself: the service runs from the source tree, and
-#    an installed copy would sit unused in site-packages and misreport the version.
+# 2. Build a fresh venv at the path the service runs from. Stop the service and move
+#    the old venv aside first; this refuses to build over one. Pin the interpreter: uv
+#    otherwise prefers a Python it manages itself, which `uv python` can later remove or
+#    replace under a running service. --no-install-project installs the [server]
+#    dependencies and not agent-bus itself: the service runs from the source tree, and an
+#    installed copy would sit unused in site-packages and misreport the version.
+[ ! -e venv ] || die "venv/ exists: stop the service and move it aside first"
 UV_PROJECT_ENVIRONMENT="$REPO/venv" \
-  uv sync --frozen --no-install-project --extra server --python /usr/bin/python3.13
+  uv sync --frozen --no-install-project --extra server --python "$PY"
 
-# 3. Confirm what was installed: the modules import from the checkout, and the
-#    dependency versions are the locked ones.
-venv/bin/python3 -c "import server, reconcile, outbox, nats_publisher"
-venv/bin/python3 -c "import importlib.metadata as m; [print(p, m.version(p)) for p in ('fastmcp', 'mcp', 'cryptography', 'nats-py')]"
+# 3. The venv is exactly the lock (no missing, extra or different package), and the
+#    modules import from the checkout.
+UV_PROJECT_ENVIRONMENT="$REPO/venv" \
+  uv sync --frozen --no-install-project --extra server --python "$PY" --check \
+  || die "venv does not match uv.lock"
+venv/bin/python3 -c "import server, reconcile, outbox, nats_publisher" \
+  || die "server modules do not import"
+echo "install: agent-bus v$VERSION ready; restart the service and its stdio clients"
 ```
 
 Build a fresh venv rather than installing into an existing one: an install into an existing
@@ -112,7 +136,8 @@ replacing its venv, and restart it after step 3. Every MCP client that spawns `s
 over stdio uses the same venv, so restart those clients too.
 
 CI audits the locked set on every push and weekly, but nothing reads a scheduled run's
-result unless you watch it. Audit the deployed venv where it runs as well (for example
+result unless you watch it, and GitHub disables a public repository's scheduled workflows
+after 60 days without activity. Audit the deployed venv where it runs as well (for example
 `pip-audit --path venv/lib/python3.13/site-packages`).
 
 Register with PM2:
