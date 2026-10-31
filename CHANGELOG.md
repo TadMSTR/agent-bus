@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Vocabulary: `subagent.started` and `subagent.stopped`, emitted by a managed Claude Code hook,
+  `subagent-lifecycle-log.py` (Claude Code `SubagentStart`/`SubagentStop` hooks) with the
+  subagent's type and id and the parent session, never its prompt or output; and
+  `subagent.write_denied`, emitted by `subagent-write-scope-hook.py` when a scoped subagent
+  edits outside its assignment. All cross-agent.
+
 ## [0.6.0] — 2026-10-30
 
 Locked dependencies. The deployed venv is built from `uv.lock`.
