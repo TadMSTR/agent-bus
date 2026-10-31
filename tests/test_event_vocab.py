@@ -260,7 +260,7 @@ def test_workspace_edit_denied_is_declared_cross_agent():
     "event_type", ["subagent.started", "subagent.stopped", "subagent.write_denied"]
 )
 def test_subagent_events_are_declared_cross_agent(event_type):
-    """host-forge-scripts' subagent hooks emit these cross-agent; strict mode must accept them."""
+    """The managed subagent hooks emit these cross-agent; strict mode must accept them."""
     assert event_type in event_vocab.CROSS_AGENT_EVENTS
     assert event_type not in event_vocab.SESSION_EVENTS
     assert event_vocab.unknown_event_reason(event_type, "enforce") is None

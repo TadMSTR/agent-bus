@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- Vocabulary: `subagent.started` and `subagent.stopped`, emitted by host-forge-scripts'
+- Vocabulary: `subagent.started` and `subagent.stopped`, emitted by a managed Claude Code hook,
   `subagent-lifecycle-log.py` (Claude Code `SubagentStart`/`SubagentStop` hooks) with the
   subagent's type and id and the parent session, never its prompt or output; and
   `subagent.write_denied`, emitted by `subagent-write-scope-hook.py` when a scoped subagent
