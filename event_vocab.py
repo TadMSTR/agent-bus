@@ -131,6 +131,15 @@ CROSS_AGENT_EVENTS = frozenset(
         # policy refused (metadata.mode "enforce") or would refuse ("log"). Cross-agent
         # on purpose: the 48 h log-only window is triaged from these.
         "workspace.edit_denied",
+        # host-forge-scripts subagent-lifecycle-log.py (SubagentStart/SubagentStop hooks):
+        # one event per subagent launch and stop, with its type and id and the parent
+        # session. No prompt text and no output. Cross-agent: which agents delegate, and to
+        # which types, is the operator's question (subagent-audit-tooling-2026-10).
+        "subagent.started",
+        "subagent.stopped",
+        # host-forge-scripts subagent-write-scope-hook.py: an edit by a scoped subagent type
+        # (doc-drafter) outside its parent's assignment, refused.
+        "subagent.write_denied",
     }
 )
 
