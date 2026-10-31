@@ -137,7 +137,7 @@ CROSS_AGENT_EVENTS = frozenset(
         # which types, is the operator's question (subagent-audit-tooling-2026-10).
         "subagent.started",
         "subagent.stopped",
-        # a managed PreToolUse hook (subagent-write-scope-hook.py): an edit by a scoped subagent type
+        # a managed PreToolUse hook (subagent-write-scope-hook.py): an edit by a scoped type
         # (doc-drafter) outside its parent's assignment, refused.
         "subagent.write_denied",
     }
