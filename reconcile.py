@@ -11,12 +11,14 @@ each prep dir), so there is no path-pattern list here to keep in step with them.
 is checked on every scan, whatever the files' mtimes, so one added after the files were
 written still collapses them.
 
-A marker is honoured only at depth 3 or deeper under artifacts/ (``audit-requests/<build>/
-<dir>`` and below; a prep dir is exactly that). One higher up, at the root, in a category dir
-(``build-plans/``, ``audit-requests/``, ...) or in a build's own dir, would hide that build's
-requests, plans or every build in a category, so it is not honoured: that tree is scanned as
+A marker is honoured only at depth 3 or deeper under artifacts/ (a prep dir,
+``audit-requests/<build>/prep``, is depth 3). One at depth 0-2 (the root, a category dir such
+as ``build-plans/``, or a dir directly under one such as ``audit-requests/<build>/``) would hide
+every build in a category or a build's requests, so it is not honoured: that tree is scanned as
 usual, and the marker is logged as ``Marker not honoured: <dir>`` once a day for as long as it
-stays.
+stays. Depth is the whole test. It guards against a marker dropped one level too high; it does
+not know what a scratch dir is, so a deeper marker is honoured wherever it is, including in an
+archived build's dir (``build-plans/archive/<build>/``) or a nested request dir.
 
 What is announced is a marker's *placement*, once, not what it hides afterwards: a file
 written into an ignored tree later produces no event, by design. Any writer under artifacts/
@@ -125,11 +127,21 @@ def _read_regular(path: Path, cap: int) -> bytes:
 
 
 def load_markers() -> set[str]:
-    """Identities of markers already announced. Anything unreadable reads as none."""
+    """Identities of markers already announced. Anything unreadable reads as none, and every
+    marker is announced again; a state file that exists but is refused says so on stderr, so a
+    planted FIFO or link leaves a trace beside the re-announcements."""
     try:
         data = json.loads(_read_regular(MARKERS_FILE, MARKERS_MAX_BYTES))
-        return {k for k in data if isinstance(k, str)} if isinstance(data, list) else set()
-    except Exception:
+        if not isinstance(data, list):
+            raise ValueError("not a JSON list")
+        return {k for k in data if isinstance(k, str)}
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        print(
+            f"reconcile: markers state refused ({type(e).__name__}); re-announcing every marker",
+            file=sys.stderr,
+        )
         return set()
 
 

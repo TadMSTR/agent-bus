@@ -13,9 +13,10 @@ All notable changes to this project will be documented in this file.
   collapses them. A marker's placement is announced once, by path and inode
   (`.reconcile-markers.json`), not by mtime, so a backdated, renamed-in or dangling-link marker
   is still logged; files added under it later are not. A marker is honoured only three or more
-  levels below `artifacts/` (an audit prep dir is exactly three): one at the root, in a
-  category dir or in a build's own dir is logged as `Marker not honoured: <dir>` once a day
-  and its tree is scanned as usual. The markers state is writable
+  levels below `artifacts/` (an audit prep dir is exactly three): one at depth 0-2 (the root,
+  a category dir, or a dir directly under one such as `audit-requests/<build>/`) is logged as
+  `Marker not honoured: <dir>` once a day and its tree is scanned as usual. Depth is the only
+  test, so a deeper marker is honoured anywhere, an archived build's dir included. The markers state is writable
   by every agent's uid, so a key written into it by hand hides a tree with no event; that is
   an accepted residual of the shared uid. One audit prep dir used to log about 40
   `artifact.untracked` events, one per batch, view and patch file.
@@ -36,6 +37,7 @@ All notable changes to this project will be documented in this file.
   fail every run and hold the cursor until someone removed it.
 - `reconcile.py` reads `.reconcile-markers.json` only if it is a regular file of at most
   4 MiB, and writes its temp file without following links. A FIFO there used to hang the run.
+  A state file that exists but is refused is reported on stderr.
 - `reconcile.py`: a marker removed between the walk and its check now fails the run and holds
   the cursor, so the files beside it are scanned next run instead of being passed over.
 

@@ -551,6 +551,16 @@ def test_a_fifo_state_file_does_not_hang_the_run(recon):
     assert reconcile.MARKERS_FILE.is_file() and not reconcile.MARKERS_FILE.is_symlink()
 
 
+def test_a_refused_state_file_is_reported(recon, capsys):
+    """Round-2 OV-01: refusing the state used to leave no trace beside the re-announcements."""
+    os.mkfifo(reconcile.MARKERS_FILE)
+    assert reconcile.load_markers() == set()
+    assert "markers state refused (OSError)" in capsys.readouterr().err
+    reconcile.MARKERS_FILE.unlink()
+    assert reconcile.load_markers() == set()  # absent is the first run, not a refusal
+    assert capsys.readouterr().err == ""
+
+
 def test_a_linked_or_oversized_state_file_reads_as_none(recon, tmp_path):
     real = tmp_path / "elsewhere.json"
     real.write_text('["k:1"]')
