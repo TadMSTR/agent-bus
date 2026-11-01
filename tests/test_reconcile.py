@@ -158,7 +158,11 @@ def _prep_tree(root):
     return prep
 
 
-def test_a_marked_tree_is_skipped_whole(recon):
+def _marker_events(events):
+    return [e for e in events if e["summary"].startswith("Ignored tree: ")]
+
+
+def test_a_marked_tree_collapses_to_one_event(recon):
     _, artifacts, logs = recon
     prep = _prep_tree(artifacts)
     (prep / reconcile.IGNORE_MARKER).write_text("")
@@ -166,19 +170,52 @@ def test_a_marked_tree_is_skipped_whole(recon):
 
     reconcile.main()
 
-    paths = [e["artifact_path"] for e in _events(logs)]
-    assert paths == [str(artifacts / "audit-requests" / "some-build" / "request.md")]
+    events = _events(logs)
+    assert sorted(e["artifact_path"] for e in events) == sorted(
+        [
+            str(artifacts / "audit-requests" / "some-build" / "request.md"),
+            str(prep / reconcile.IGNORE_MARKER),
+        ]
+    )
+    [m] = _marker_events(events)
+    assert m["summary"] == "Ignored tree: audit-requests/some-build/prep"
+    assert m["event"] == "artifact.untracked"
 
 
-def test_the_marker_itself_is_not_logged(recon):
+def test_the_skip_is_never_silent(recon):
+    """OV-40: a marker anywhere, the root included, is itself on the bus."""
     _, artifacts, logs = recon
-    d = artifacts / "scratch"
-    d.mkdir()
-    (d / reconcile.IGNORE_MARKER).write_text("")
+    (artifacts / "a.md").write_text("x")
+    (artifacts / reconcile.IGNORE_MARKER).write_text("")
 
     reconcile.main()
 
-    assert _events(logs) == []
+    events = _events(logs)
+    assert [e["summary"] for e in events] == ["Ignored tree: ."]
+
+
+def test_a_dangling_link_marker_is_logged(recon):
+    _, artifacts, logs = recon
+    d = artifacts / "scratch"
+    d.mkdir()
+    (d / "a.md").write_text("x")
+    (d / reconcile.IGNORE_MARKER).symlink_to(d / "nowhere")
+
+    reconcile.main()
+
+    assert [e["summary"] for e in _events(logs)] == ["Ignored tree: scratch"]
+
+
+def test_a_marker_is_logged_once(recon):
+    _, artifacts, logs = recon
+    prep = _prep_tree(artifacts)
+    (prep / reconcile.IGNORE_MARKER).write_text("")
+
+    reconcile.main()
+    reconcile.CURSOR_FILE.unlink()  # only the intra-day dedup stands between it and a repeat
+    reconcile.main()
+
+    assert len(_marker_events(_events(logs))) == 1
 
 
 def test_a_marker_added_after_the_files_still_hides_them(recon):
@@ -196,7 +233,7 @@ def test_a_marker_added_after_the_files_still_hides_them(recon):
 
     reconcile.main()
 
-    assert _events(logs) == []
+    assert [e["summary"] for e in _events(logs)] == ["Ignored tree: audit-requests/some-build/prep"]
 
 
 def test_without_the_marker_the_same_tree_is_logged(recon):
@@ -219,7 +256,9 @@ def test_a_marker_hides_only_its_own_tree(recon):
 
     reconcile.main()
 
-    assert [e["artifact_path"] for e in _events(logs)] == [str(sibling / "note.md")]
+    assert [
+        e["artifact_path"] for e in _events(logs) if not e["summary"].startswith("Ignored")
+    ] == [str(sibling / "note.md")]
 
 
 def test_a_directory_named_like_the_marker_does_not_hide_anything(recon):
@@ -231,3 +270,25 @@ def test_a_directory_named_like_the_marker_does_not_hide_anything(recon):
     reconcile.main()
 
     assert [e["artifact_path"] for e in _events(logs)] == [str(d / "a.md")]
+
+
+def test_an_unreadable_directory_fails_the_run_and_holds_the_cursor(recon, monkeypatch, capsys):
+    """OV-39: a walk error is never read as an empty directory. Simulated through os.walk's
+    onerror, because chmod 000 does not stop root, and CI runs as root."""
+    _, artifacts, logs = recon
+    (artifacts / "a.md").write_text("x")
+    real_walk = os.walk
+
+    def walk(top, onerror=None, **kw):
+        onerror(PermissionError(13, "Permission denied", str(artifacts / "locked")))
+        yield from real_walk(top, onerror=onerror, **kw)
+
+    monkeypatch.setattr(reconcile.os, "walk", walk)
+    with pytest.raises(SystemExit) as e:
+        reconcile.main()
+
+    assert e.value.code == 1
+    err = capsys.readouterr().err
+    assert "could not read" in err and str(artifacts / "locked") in err
+    assert not reconcile.CURSOR_FILE.exists()
+    assert len(_events(logs)) == 1  # what it could read is still logged

@@ -6,11 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- `reconcile.py` skips any directory that contains a `.reconcile-ignore` file: the marker,
-  its siblings and everything below. Whoever writes a scratch tree drops the marker in its
-  root; there is no path-pattern list. It is checked on every scan, so a marker added after
-  the files still hides them. One audit prep dir used to log about 40 `artifact.untracked`
-  events, one per batch, view and patch file.
+- `reconcile.py` collapses any directory that contains a `.reconcile-ignore` file to one
+  event: the marker itself is logged (`Ignored tree: <dir>`), and its siblings and everything
+  below are not. Whoever writes a scratch tree drops the marker in its root; there is no
+  path-pattern list. It is checked on every scan, so a marker added after the files still
+  collapses them, and a skip is never silent (a dangling-link marker is logged too). One audit
+  prep dir used to log about 40 `artifact.untracked` events, one per batch, view and patch file.
+
+### Fixed
+
+- `reconcile.py`: a directory the walk can't read is printed to stderr and the run exits 1
+  without moving the cursor, so it is retried next run. Before, it read as empty and the
+  cursor moved past it.
 
 - Vocabulary: `subagent.started` and `subagent.stopped`, emitted by a managed Claude Code hook,
   `subagent-lifecycle-log.py` (Claude Code `SubagentStart`/`SubagentStop` hooks) with the
