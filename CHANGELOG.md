@@ -30,7 +30,7 @@ All notable changes to this project will be documented in this file.
 - Vocabulary: `audit.baseline.completed`, emitted once per pre-audit pass by the
   `security-baseline` skill with the build, round, side, verdict counts and the kb-checkers'
   usage totals (host-forge-scripts `audit-round-ledger.py --summary`). Cross-agent
-  (audit-workflow-2026-11 p2, #1357 (id 1440)).
+  (audit-workflow-2026-11 p2).
 
 ### Fixed
 
