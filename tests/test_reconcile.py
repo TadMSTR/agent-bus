@@ -5,6 +5,7 @@ writers that previously chained nothing and held no lock.
 """
 
 import json
+import os
 from datetime import datetime, timezone
 
 import pytest
@@ -133,3 +134,100 @@ def test_log_path_targets_the_cross_agent_file(recon):
 def test_no_output_when_nothing_found(recon, capsys):
     reconcile.main()
     assert capsys.readouterr().out == ""
+
+
+# ---------------------------------------------------------------------------
+# .reconcile-ignore (audit-workflow-2026-11 p1)
+# ---------------------------------------------------------------------------
+
+
+def _prep_tree(root):
+    """A security-check-prep.py-shaped scratch dir, nested two levels."""
+    prep = root / "audit-requests" / "some-build" / "prep"
+    (prep / "batches").mkdir(parents=True)
+    (prep / "views").mkdir()
+    (prep / "returns").mkdir()
+    for rel in (
+        "manifest.json",
+        "diff.patch",
+        "batches/b01.md",
+        "views/v01.md",
+        "returns/b01.jsonl",
+    ):
+        (prep / rel).write_text("x")
+    return prep
+
+
+def test_a_marked_tree_is_skipped_whole(recon):
+    _, artifacts, logs = recon
+    prep = _prep_tree(artifacts)
+    (prep / reconcile.IGNORE_MARKER).write_text("")
+    (artifacts / "audit-requests" / "some-build" / "request.md").write_text("x")
+
+    reconcile.main()
+
+    paths = [e["artifact_path"] for e in _events(logs)]
+    assert paths == [str(artifacts / "audit-requests" / "some-build" / "request.md")]
+
+
+def test_the_marker_itself_is_not_logged(recon):
+    _, artifacts, logs = recon
+    d = artifacts / "scratch"
+    d.mkdir()
+    (d / reconcile.IGNORE_MARKER).write_text("")
+
+    reconcile.main()
+
+    assert _events(logs) == []
+
+
+def test_a_marker_added_after_the_files_still_hides_them(recon):
+    _, artifacts, logs = recon
+    prep = _prep_tree(artifacts)
+    # Cursor older than the files, so only the marker can keep them out; the files are
+    # older than the marker, which is what a marker written after the fact looks like.
+    reconcile.CURSOR_FILE.touch()
+    t = reconcile.CURSOR_FILE.stat().st_mtime
+    os.utime(reconcile.CURSOR_FILE, (t - 100, t - 100))
+    for f in prep.rglob("*"):
+        if f.is_file():
+            os.utime(f, (t - 50, t - 50))
+    (prep / reconcile.IGNORE_MARKER).write_text("")
+
+    reconcile.main()
+
+    assert _events(logs) == []
+
+
+def test_without_the_marker_the_same_tree_is_logged(recon):
+    """The control: it is the marker, not the layout, that hides the tree."""
+    _, artifacts, logs = recon
+    _prep_tree(artifacts)
+
+    reconcile.main()
+
+    assert len(_events(logs)) == 5
+
+
+def test_a_marker_hides_only_its_own_tree(recon):
+    _, artifacts, logs = recon
+    prep = _prep_tree(artifacts)
+    (prep / reconcile.IGNORE_MARKER).write_text("")
+    sibling = artifacts / "audit-requests" / "some-build" / "other"
+    sibling.mkdir()
+    (sibling / "note.md").write_text("x")
+
+    reconcile.main()
+
+    assert [e["artifact_path"] for e in _events(logs)] == [str(sibling / "note.md")]
+
+
+def test_a_directory_named_like_the_marker_does_not_hide_anything(recon):
+    _, artifacts, logs = recon
+    d = artifacts / "x"
+    (d / reconcile.IGNORE_MARKER).mkdir(parents=True)
+    (d / "a.md").write_text("x")
+
+    reconcile.main()
+
+    assert [e["artifact_path"] for e in _events(logs)] == [str(d / "a.md")]

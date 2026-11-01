@@ -4,6 +4,12 @@ reconcile.py — scan ~/.claude/comms/artifacts/ for files not yet in today's cr
 Runs every 5 minutes via PM2 cron. Writes directly to JSONL (not via MCP) since it IS
 the agent-bus reconciliation path.
 
+A directory that contains a ``.reconcile-ignore`` file is skipped whole: the marker, every
+file beside it and everything below it. Whoever writes a scratch tree owns its marker
+(security-check-prep.py writes one into each prep dir), so there is no path-pattern list
+here to keep in step with them. The marker is checked on every scan, whatever the files'
+mtimes, so one added after the files were written still hides them.
+
 Appends through ``event_log`` so its events chain and lock like every other writer's.
 It previously appended raw, with no ``prev_hash`` and no lock — which meant a PM2 cron
 firing while the server was writing could interleave and break the chain outright.
@@ -20,6 +26,7 @@ COMMS_DIR = Path(os.environ.get("AGENT_BUS_COMMS_DIR") or str(Path.home() / ".cl
 ARTIFACTS_DIR = COMMS_DIR / "artifacts"
 LOGS_DIR = COMMS_DIR / "logs"
 CURSOR_FILE = COMMS_DIR / ".reconcile-cursor"
+IGNORE_MARKER = ".reconcile-ignore"
 HOSTNAME = os.uname().nodename
 
 # Self-healing: create log dir if missing on first run
@@ -49,12 +56,23 @@ def known_artifact_paths() -> set[str]:
     return paths
 
 
+def artifact_files():
+    """Every file under ARTIFACTS_DIR outside an ignored tree. Directory links are not followed."""
+    for dirpath, dirnames, filenames in os.walk(ARTIFACTS_DIR):
+        if IGNORE_MARKER in filenames:
+            dirnames[:] = []
+            continue
+        dirnames.sort()
+        for name in sorted(filenames):
+            yield Path(dirpath) / name
+
+
 def main() -> None:
     cursor_mtime = CURSOR_FILE.stat().st_mtime if CURSOR_FILE.exists() else 0
     known = known_artifact_paths()
     found = 0
 
-    for f in ARTIFACTS_DIR.rglob("*"):
+    for f in artifact_files():
         if not f.is_file():
             continue
         if f.stat().st_mtime <= cursor_mtime:

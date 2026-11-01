@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `reconcile.py` skips any directory that contains a `.reconcile-ignore` file: the marker,
+  its siblings and everything below. Whoever writes a scratch tree drops the marker in its
+  root; there is no path-pattern list. It is checked on every scan, so a marker added after
+  the files still hides them. One audit prep dir used to log about 40 `artifact.untracked`
+  events, one per batch, view and patch file.
+
 - Vocabulary: `subagent.started` and `subagent.stopped`, emitted by a managed Claude Code hook,
   `subagent-lifecycle-log.py` (Claude Code `SubagentStart`/`SubagentStop` hooks) with the
   subagent's type and id and the parent session, never its prompt or output; and
