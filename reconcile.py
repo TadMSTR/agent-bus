@@ -1,26 +1,40 @@
 #!/usr/bin/env python3
 """
 reconcile.py — scan ~/.claude/comms/artifacts/ for files not yet in today's cross-agent log.
-Runs every 5 minutes from the ted crontab, through hc-run (the PM2 entry in ecosystem.config.js
-is not started). Writes directly to JSONL (not via MCP) since it IS
-the agent-bus reconciliation path.
+Runs every 5 minutes from cron (the PM2 entry in ecosystem.config.js is not started). Writes
+directly to JSONL (not via MCP) since it IS the agent-bus reconciliation path.
 
 A directory that contains a ``.reconcile-ignore`` file is collapsed to one event: the marker
 itself is logged (summary ``Ignored tree: <dir>``), and every file beside it and below it is
 not. Whoever writes a scratch tree owns its marker (security-check-prep.py writes one into
 each prep dir), so there is no path-pattern list here to keep in step with them. The marker
 is checked on every scan, whatever the files' mtimes, so one added after the files were
-written still collapses them. A skip is never silent: any writer under artifacts/ can drop a
-marker, and the event is what shows where one was dropped. A marker is announced by identity
+written still collapses them.
+
+A marker is honoured only at depth 2 or deeper under artifacts/ (``audit-requests/<build>``
+and below; a prep dir is depth 3). One at the root or in a category dir (``build-plans/``,
+``audit-requests/``, ...) would end reconciliation of everything beneath it, so it is not
+honoured: that tree is scanned as usual, and the marker is logged as ``Marker not honoured:
+<dir>`` once a day for as long as it stays.
+
+What is announced is a marker's *placement*, once, not what it hides afterwards: a file
+written into an ignored tree later produces no event, by design. Any writer under artifacts/
+can drop a marker, and the event is what shows where. A marker is announced by identity
 (path and inode, kept in ``.reconcile-markers.json`` beside the cursor), not by mtime, so a
-backdated marker, or an old file renamed into place, is still announced. An unreadable or
-corrupt state file re-announces every marker: noisy, never silent.
+backdated marker, or an old file renamed into place, is still announced. An unreadable,
+corrupt or non-regular state file re-announces every marker. The state file is writable by
+the same uid as every agent, so a key written into it by hand hides a tree with no event at
+all (see SECURITY[accepted] at MARKERS_FILE).
+
+A name that is not valid UTF-8 is logged with its undecodable bytes backslash-escaped, so it
+lands as a normal event rather than failing every run. Two names that escape to the same
+string (``a\\xff`` written literally) share one dedup entry for the day.
 
 A directory the walk cannot read is printed to stderr and the run exits 1 without moving
-the cursor, so the next run retries it, and hc-run reports the failure. While the cursor is
-held, the dedup is today's log only, so an error that persists past midnight re-logs what is
-newer than the cursor once more: a repeat, never a loss. Before this, an unreadable subtree
-read as empty.
+the cursor, so the next run retries it, and the cron wrapper reports the failure. While the
+cursor is held, the dedup is today's log only, so an error that persists past midnight
+re-logs what is newer than the cursor once more: a repeat, never a loss. Before this, an
+unreadable subtree read as empty.
 
 Appends through ``event_log`` so its events chain and lock like every other writer's.
 It previously appended raw, with no ``prev_hash`` and no lock — which meant a PM2 cron
@@ -29,6 +43,7 @@ firing while the server was writing could interleave and break the chain outrigh
 
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -41,12 +56,19 @@ LOGS_DIR = COMMS_DIR / "logs"
 CURSOR_FILE = COMMS_DIR / ".reconcile-cursor"
 # SECURITY[accepted]: the markers state, like the cursor beside it, is writable by the same uid
 # as every agent whose artifacts this scans. An agent can pre-seed a marker's `path:inode` here
-# and hide its tree with no event, exactly as it can backdate .reconcile-cursor today. The
-# reconciler surfaces forgotten artifacts; it has never been a boundary against a same-uid
-# agent. Closing it needs per-agent UIDs, vikunja#404. Accepted by the operator 2026-11-01.
-# Audit: 2026-11-01/audit-workflow-2026-11-p1-round-capture (pre-audit OV-40).
+# and hide its tree with no event. That is persistent, not one window like a forward-dated
+# .reconcile-cursor (the next run touches the cursor back to now): a seen key is carried
+# forward every run for as long as the marker exists. The reconciler surfaces forgotten
+# artifacts; it has never been a boundary against a same-uid agent. Closing it needs per-agent
+# UIDs, vikunja#404. Accepted by the operator 2026-11-01; ruling upheld by audit F-04.
+# Audit: 2026-11-01/audit-workflow-2026-11-p1-round-capture (pre-audit OV-40, audit F-04).
 MARKERS_FILE = COMMS_DIR / ".reconcile-markers.json"
+# Must match IGNORE_MARKER in host-forge-scripts security-check-prep.py, which writes it.
 IGNORE_MARKER = ".reconcile-ignore"
+# A marker shallower than this (the artifacts root is 0, a category dir is 1) is not honoured.
+MIN_MARKER_DEPTH = 2
+# The state holds only `path:inode` keys; anything larger is not ours. Read as unreadable.
+MARKERS_MAX_BYTES = 4 << 20
 HOSTNAME = os.uname().nodename
 
 # Self-healing: create log dir if missing on first run
@@ -76,10 +98,33 @@ def known_artifact_paths() -> set[str]:
     return paths
 
 
+def _read_regular(path: Path, cap: int) -> bytes:
+    """Read a regular file of at most ``cap`` bytes. A FIFO, device or link (to anything) is
+    refused before it is opened, so it can neither block the run nor feed it without end."""
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(f"not a regular file: {path}")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode) or (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+            raise OSError(f"replaced while opening: {path}")
+        chunks, size = [], 0
+        while size <= cap:
+            chunk = os.read(fd, min(1 << 16, cap + 1 - size))
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            size += len(chunk)
+        raise OSError(f"over {cap} bytes: {path}")
+    finally:
+        os.close(fd)
+
+
 def load_markers() -> set[str]:
     """Identities of markers already announced. Anything unreadable reads as none."""
     try:
-        data = json.loads(MARKERS_FILE.read_text())
+        data = json.loads(_read_regular(MARKERS_FILE, MARKERS_MAX_BYTES))
         return {k for k in data if isinstance(k, str)} if isinstance(data, list) else set()
     except Exception:
         return set()
@@ -87,22 +132,38 @@ def load_markers() -> set[str]:
 
 def save_markers(keys: set[str]) -> None:
     tmp = MARKERS_FILE.with_name(MARKERS_FILE.name + ".tmp")
-    tmp.write_text(json.dumps(sorted(keys)))
+    tmp.unlink(missing_ok=True)  # a stale one, or a planted link: never written through
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(sorted(keys)))
     os.replace(tmp, MARKERS_FILE)
 
 
+def _display(p: Path) -> str:
+    """``p`` as a str the log can encode: undecodable bytes are backslash-escaped."""
+    return os.fsencode(p).decode("utf-8", "backslashreplace")
+
+
+FILE, TREE, NOT_HONOURED = "file", "tree", "not-honoured"
+
+
 def artifact_files(errors: list[OSError]):
-    """(path, ignored_tree) for every file to log: each file outside an ignored tree, and the
-    marker of each ignored tree. Directory links are not followed. Walk errors are appended
-    to ``errors``, never swallowed."""
+    """(path, kind) for every item to log: FILE for each file outside an ignored tree, TREE for
+    the marker of each ignored tree, NOT_HONOURED for a marker too shallow to honour (its tree
+    is scanned as usual). Directory links are not followed. Walk errors are appended to
+    ``errors``, never swallowed."""
     for dirpath, dirnames, filenames in os.walk(ARTIFACTS_DIR, onerror=errors.append):
+        here = Path(dirpath)
         if IGNORE_MARKER in filenames:
-            dirnames[:] = []
-            yield Path(dirpath) / IGNORE_MARKER, True
-            continue
+            if len(here.relative_to(ARTIFACTS_DIR).parts) >= MIN_MARKER_DEPTH:
+                dirnames[:] = []
+                yield here / IGNORE_MARKER, TREE
+                continue
+            yield here / IGNORE_MARKER, NOT_HONOURED
         dirnames.sort()
         for name in sorted(filenames):
-            yield Path(dirpath) / name, False
+            if name != IGNORE_MARKER:
+                yield here / name, FILE
 
 
 def main() -> None:
@@ -114,12 +175,16 @@ def main() -> None:
     item_errors: list[str] = []
     announced = load_markers()
     seen: set[str] = set()
-    for f, ignored_tree in artifact_files(errors):
+    for f, kind in artifact_files(errors):
         try:
-            found += _reconcile_one(f, ignored_tree, cursor_mtime, known, announced, seen)
+            found += _reconcile_one(f, kind, cursor_mtime, known, announced, seen)
         except FileNotFoundError:
-            continue  # removed between the walk and the stat: nothing left to log
-        except Exception as e:  # one bad item (e.g. a non-UTF-8 name) must not stop the scan
+            if kind == TREE:
+                # its tree was already pruned from this walk; holding the cursor makes the
+                # next run walk it, so files beside a removed marker are not lost
+                item_errors.append(f"{os.fsencode(f)!r}: marker vanished mid-scan")
+            # a file removed between the walk and the stat: nothing left to log
+        except Exception as e:  # one bad item must not stop the scan
             item_errors.append(f"{os.fsencode(f)!r}: {type(e).__name__}")
 
     if found:
@@ -138,38 +203,42 @@ def main() -> None:
 
 def _reconcile_one(
     f: Path,
-    ignored_tree: bool,
+    kind: str,
     cursor_mtime: float,
     known: set[str],
     announced: set[str],
     seen: set[str],
 ) -> int:
     """Log one artifact (or one marker). Returns 1 if an event was appended, else 0."""
-    path_str = str(f)
-    if ignored_tree:
+    path_str = _display(f)
+    if kind == TREE:
         # identity, not mtime: a backdated or renamed-in marker must still be announced.
         # lstat: a marker that is a dangling link still hides its tree, so it counts too.
         key = f"{path_str}:{f.lstat().st_ino}"
         if key in announced:
             seen.add(key)
             return 0
+    elif kind == NOT_HONOURED:
+        f.lstat()  # gone since the walk: FileNotFoundError, nothing to log
+        if path_str in known:  # once a day, whatever its mtime, for as long as it stays
+            return 0
     elif not f.is_file() or f.stat().st_mtime <= cursor_mtime or path_str in known:
         return 0
 
+    rel = _display(f.parent.relative_to(ARTIFACTS_DIR))
     event = build_event(
         event_type="artifact.untracked",
         source="reconciliation",
-        summary=(
-            f"Ignored tree: {f.parent.relative_to(ARTIFACTS_DIR)}"
-            if ignored_tree
-            else f"Untracked artifact: {f.name}"
-        ),
+        summary={
+            TREE: f"Ignored tree: {rel}",
+            NOT_HONOURED: f"Marker not honoured: {rel}",
+        }.get(kind, f"Untracked artifact: {_display(Path(f.name))}"),
         scope="cross-agent",
         artifact_path=path_str,
         hostname=HOSTNAME,
     )
     append_event(event, "cross-agent", LOGS_DIR)
-    if ignored_tree:
+    if kind == TREE:
         seen.add(key)  # only once its event is on the log: a failed append re-announces next run
     return 1
 

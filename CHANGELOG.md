@@ -10,10 +10,14 @@ All notable changes to this project will be documented in this file.
   event: the marker itself is logged (`Ignored tree: <dir>`), and its siblings and everything
   below are not. Whoever writes a scratch tree drops the marker in its root; there is no
   path-pattern list. It is checked on every scan, so a marker added after the files still
-  collapses them, and a skip is never silent: markers are announced by path and inode
+  collapses them. A marker's placement is announced once, by path and inode
   (`.reconcile-markers.json`), not by mtime, so a backdated, renamed-in or dangling-link marker
-  is still logged. One audit
-  prep dir used to log about 40 `artifact.untracked` events, one per batch, view and patch file.
+  is still logged; files added under it later are not. A marker is honoured only two or more
+  levels below `artifacts/`: one at the root or in a category dir is logged as `Marker not
+  honoured: <dir>` once a day and its tree is scanned as usual. The markers state is writable
+  by every agent's uid, so a key written into it by hand hides a tree with no event; that is
+  an accepted residual of the shared uid. One audit prep dir used to log about 40
+  `artifact.untracked` events, one per batch, view and patch file.
 
 - Vocabulary: `subagent.started` and `subagent.stopped`, emitted by a managed Claude Code hook,
   `subagent-lifecycle-log.py` (Claude Code `SubagentStart`/`SubagentStop` hooks) with the
@@ -26,6 +30,12 @@ All notable changes to this project will be documented in this file.
 - `reconcile.py`: a directory the walk can't read is printed to stderr and the run exits 1
   without moving the cursor, so it is retried next run. Before, it read as empty and the
   cursor moved past it.
+- `reconcile.py`: a file name that isn't valid UTF-8 is logged with its bad bytes
+  backslash-escaped. It used to fail every run and hold the cursor until someone removed it.
+- `reconcile.py` reads `.reconcile-markers.json` only if it is a regular file of at most
+  4 MiB, and writes its temp file without following links. A FIFO there used to hang the run.
+- `reconcile.py`: a marker removed between the walk and its check now fails the run and holds
+  the cursor, so the files beside it are scanned next run instead of being passed over.
 
 ## [0.6.0] — 2026-10-30
 

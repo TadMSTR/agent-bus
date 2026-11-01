@@ -183,28 +183,66 @@ def test_a_marked_tree_collapses_to_one_event(recon):
     assert m["event"] == "artifact.untracked"
 
 
-def test_the_skip_is_never_silent(recon):
-    """OV-40: a marker anywhere, the root included, is itself on the bus."""
+@pytest.mark.parametrize("where", [(), ("audit-requests",)])
+def test_a_marker_at_the_root_or_a_category_is_not_honoured(recon, where):
+    """Audit F-01: a marker that shallow would end reconciliation of a whole category. Its
+    tree is scanned as usual, including files written after it, and the marker is logged."""
     _, artifacts, logs = recon
-    (artifacts / "a.md").write_text("x")
+    top = artifacts.joinpath(*where)
+    (top / "b1").mkdir(parents=True)
+    (top / reconcile.IGNORE_MARKER).write_text("")
+    (top / "b1" / "request.md").write_text("x")
+
+    reconcile.main()
+    _backdate(reconcile.CURSOR_FILE, by=10)  # so the next file is newer than the cursor
+    (top / "b1" / "request-round2.md").write_text("x")
+    reconcile.main()
+
+    rel = "/".join(where) or "."
+    assert sorted(e["summary"] for e in _events(logs)) == [
+        f"Marker not honoured: {rel}",
+        "Untracked artifact: request-round2.md",
+        "Untracked artifact: request.md",
+    ]
+
+
+def test_a_marker_not_honoured_is_logged_once_a_day(recon):
+    _, artifacts, logs = recon
     (artifacts / reconcile.IGNORE_MARKER).write_text("")
+    reconcile.main()
+    reconcile.main()
+    assert len(_events(logs)) == 1
+    (logs / next(logs.iterdir()).name).unlink()  # a new day's log
 
     reconcile.main()
 
-    events = _events(logs)
-    assert [e["summary"] for e in events] == ["Ignored tree: ."]
+    assert [e["summary"] for e in _events(logs)] == ["Marker not honoured: ."]
+
+
+def test_a_shallow_marker_does_not_stop_a_deeper_one(recon):
+    _, artifacts, logs = recon
+    (artifacts / reconcile.IGNORE_MARKER).write_text("")
+    prep = _prep_tree(artifacts)
+    (prep / reconcile.IGNORE_MARKER).write_text("")
+
+    reconcile.main()
+
+    assert sorted(e["summary"] for e in _events(logs)) == [
+        "Ignored tree: audit-requests/some-build/prep",
+        "Marker not honoured: .",
+    ]
 
 
 def test_a_dangling_link_marker_is_logged(recon):
     _, artifacts, logs = recon
-    d = artifacts / "scratch"
-    d.mkdir()
+    d = artifacts / "work" / "scratch"
+    d.mkdir(parents=True)
     (d / "a.md").write_text("x")
     (d / reconcile.IGNORE_MARKER).symlink_to(d / "nowhere")
 
     reconcile.main()
 
-    assert [e["summary"] for e in _events(logs)] == ["Ignored tree: scratch"]
+    assert [e["summary"] for e in _events(logs)] == ["Ignored tree: work/scratch"]
 
 
 def test_a_marker_is_logged_once(recon):
@@ -229,8 +267,8 @@ def test_a_backdated_marker_is_still_announced(recon):
     """OV-40/OV-01 round 2: the marker is not subject to the mtime cursor."""
     _, artifacts, logs = recon
     reconcile.main()  # sets the cursor
-    d = artifacts / "scratch"
-    d.mkdir()
+    d = artifacts / "work" / "scratch"
+    d.mkdir(parents=True)
     (d / "a.md").write_text("x")
     _backdate(d / "a.md")
     (d / reconcile.IGNORE_MARKER).write_text("")
@@ -238,13 +276,13 @@ def test_a_backdated_marker_is_still_announced(recon):
 
     reconcile.main()
 
-    assert [e["summary"] for e in _events(logs)] == ["Ignored tree: scratch"]
+    assert [e["summary"] for e in _events(logs)] == ["Ignored tree: work/scratch"]
 
 
 def test_an_old_file_renamed_onto_the_marker_is_announced(recon):
     _, artifacts, logs = recon
-    d = artifacts / "scratch"
-    d.mkdir()
+    d = artifacts / "work" / "scratch"
+    d.mkdir(parents=True)
     old = d / "old.md"
     old.write_text("x")
     reconcile.main()  # logs old.md, sets the cursor
@@ -253,13 +291,13 @@ def test_an_old_file_renamed_onto_the_marker_is_announced(recon):
 
     reconcile.main()
 
-    assert [e["summary"] for e in _events(logs)][-1] == "Ignored tree: scratch"
+    assert [e["summary"] for e in _events(logs)][-1] == "Ignored tree: work/scratch"
 
 
 def test_a_replaced_marker_is_announced_again(recon):
     _, artifacts, logs = recon
-    d = artifacts / "scratch"
-    d.mkdir()
+    d = artifacts / "work" / "scratch"
+    d.mkdir(parents=True)
     m = d / reconcile.IGNORE_MARKER
     m.write_text("")
     reconcile.main()
@@ -276,8 +314,8 @@ def test_a_replaced_marker_is_announced_again(recon):
 
 def test_a_corrupt_state_file_re_announces(recon):
     _, artifacts, logs = recon
-    d = artifacts / "scratch"
-    d.mkdir()
+    d = artifacts / "work" / "scratch"
+    d.mkdir(parents=True)
     (d / reconcile.IGNORE_MARKER).write_text("")
     reconcile.main()
     (logs / next(logs.iterdir()).name).unlink()
@@ -378,20 +416,56 @@ def test_a_walk_error_keeps_announced_markers(recon, monkeypatch):
     assert "/gone/elsewhere/.reconcile-ignore:1" in reconcile.MARKERS_FILE.read_text()
 
 
-def test_one_bad_item_does_not_stop_the_scan(recon, capsys):
-    """OV-33: a non-UTF-8 name can't be encoded into the log. It is reported, the rest is
-    logged, and the run fails loudly with the cursor held."""
+def test_a_non_utf8_name_is_logged_escaped(recon):
+    """Audit F-05: a non-UTF-8 name used to fail every run and hold the cursor until someone
+    removed the file. It is logged with the bad byte escaped, and the run succeeds."""
     _, artifacts, logs = recon
-    os.close(os.open(os.fsencode(artifacts) + b"/bad\xff.md", os.O_CREAT | os.O_WRONLY, 0o600))
-    (artifacts / "zz-good.md").write_text("x")
+    d = os.fsencode(artifacts / "work") + b"/d\xfe"
+    os.makedirs(d)
+    os.close(os.open(d + b"/bad\xff.md", os.O_CREAT | os.O_WRONLY, 0o600))
 
+    reconcile.main()
+    reconcile.main()  # and not again
+
+    [e] = _events(logs)
+    assert e["artifact_path"] == str(artifacts / "work") + "/d\\xfe/bad\\xff.md"
+    assert e["summary"] == "Untracked artifact: bad\\xff.md"
+    assert reconcile.CURSOR_FILE.exists()
+
+
+def test_a_non_utf8_marker_dir_is_announced_escaped(recon):
+    _, artifacts, logs = recon
+    d = os.fsencode(artifacts / "work") + b"/p\xff"
+    os.makedirs(d)
+    os.close(os.open(d + b"/" + reconcile.IGNORE_MARKER.encode(), os.O_CREAT | os.O_WRONLY))
+
+    reconcile.main()
+    reconcile.main()
+
+    assert [e["summary"] for e in _events(logs)] == ["Ignored tree: work/p\\xff"]
+
+
+def test_one_bad_item_does_not_stop_the_scan(recon, monkeypatch, capsys):
+    """OV-33: an item that can't be logged is reported, the rest is logged, and the run fails
+    loudly with the cursor held."""
+    _, artifacts, logs = recon
+    (artifacts / "bad.md").write_text("x")
+    (artifacts / "zz-good.md").write_text("x")
+    real = reconcile.append_event
+
+    def append(event, *a, **k):
+        if event["artifact_path"].endswith("bad.md"):
+            raise OSError("disk full")
+        return real(event, *a, **k)
+
+    monkeypatch.setattr(reconcile, "append_event", append)
     with pytest.raises(SystemExit) as e:
         reconcile.main()
 
     assert e.value.code == 1
     assert [x["artifact_path"] for x in _events(logs)] == [str(artifacts / "zz-good.md")]
     err = capsys.readouterr().err
-    assert "could not log" in err and "bad\\xff.md" in err
+    assert "could not log" in err and "bad.md" in err
     assert not reconcile.CURSOR_FILE.exists()
 
 
@@ -401,8 +475,8 @@ def test_a_file_that_vanishes_mid_scan_is_skipped(recon, monkeypatch):
     real = reconcile.artifact_files
 
     def files(errors):
-        yield artifacts / "gone.md", False
-        yield artifacts / "gone" / reconcile.IGNORE_MARKER, True
+        yield artifacts / "gone.md", reconcile.FILE
+        yield artifacts / reconcile.IGNORE_MARKER, reconcile.NOT_HONOURED
         yield from real(errors)
 
     monkeypatch.setattr(reconcile, "artifact_files", files)
@@ -412,10 +486,83 @@ def test_a_file_that_vanishes_mid_scan_is_skipped(recon, monkeypatch):
     assert reconcile.CURSOR_FILE.exists()
 
 
+def test_a_marker_that_vanishes_mid_scan_holds_the_cursor(recon, capsys):
+    """Audit F-04 case 4 (IV-81): the walk has already pruned the marker's tree. If the run
+    succeeded, the cursor would move past the files beside it and they would never be
+    logged, although the marker is gone. The run fails, and the next one logs them."""
+    _, artifacts, logs = recon
+    d = artifacts / "work" / "scratch"
+    d.mkdir(parents=True)
+    (d / "a.md").write_text("x")
+    marker = d / reconcile.IGNORE_MARKER
+    marker.write_text("")
+    real = reconcile.artifact_files
+
+    def files(errors):
+        for f, kind in real(errors):
+            if kind == reconcile.TREE:
+                f.unlink()
+            yield f, kind
+
+    reconcile.artifact_files, saved = files, real
+    try:
+        with pytest.raises(SystemExit) as e:
+            reconcile.main()
+    finally:
+        reconcile.artifact_files = saved
+    assert e.value.code == 1
+    assert "marker vanished" in capsys.readouterr().err
+    assert not reconcile.CURSOR_FILE.exists()
+
+    reconcile.main()
+
+    assert [x["artifact_path"] for x in _events(logs)] == [str(d / "a.md")]
+
+
+def test_a_fifo_state_file_does_not_hang_the_run(recon):
+    """Audit F-06: read_text() on a FIFO blocks forever. It is refused unopened, read as no
+    state (every marker re-announced), and replaced by a regular file."""
+    _, artifacts, logs = recon
+    d = artifacts / "work" / "scratch"
+    d.mkdir(parents=True)
+    (d / reconcile.IGNORE_MARKER).write_text("")
+    os.mkfifo(reconcile.MARKERS_FILE)
+
+    reconcile.main()  # would block in read_text()
+
+    assert [e["summary"] for e in _events(logs)] == ["Ignored tree: work/scratch"]
+    assert reconcile.MARKERS_FILE.is_file() and not reconcile.MARKERS_FILE.is_symlink()
+
+
+def test_a_linked_or_oversized_state_file_reads_as_none(recon, tmp_path):
+    real = tmp_path / "elsewhere.json"
+    real.write_text('["k:1"]')
+    reconcile.MARKERS_FILE.symlink_to(real)
+    assert reconcile.load_markers() == set()  # a link, even to a good file
+    reconcile.MARKERS_FILE.unlink()
+    reconcile.MARKERS_FILE.write_text('["k:1"]')
+    assert reconcile.load_markers() == {"k:1"}  # the control
+    reconcile.MARKERS_FILE.write_text(" " * (reconcile.MARKERS_MAX_BYTES + 1) + "[]")
+    assert reconcile.load_markers() == set()
+
+
+def test_save_markers_does_not_write_through_a_planted_tmp_link(recon, tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_text("keep")
+    tmp = reconcile.MARKERS_FILE.with_name(reconcile.MARKERS_FILE.name + ".tmp")
+    tmp.symlink_to(victim)
+
+    reconcile.save_markers({"k:1"})
+
+    assert victim.read_text() == "keep"
+    assert json.loads(reconcile.MARKERS_FILE.read_text()) == ["k:1"]
+    assert not reconcile.MARKERS_FILE.is_symlink()
+
+
 def test_a_marker_whose_event_failed_is_announced_next_run(recon, monkeypatch):
     _, artifacts, logs = recon
-    d = artifacts / "scratch"
-    d.mkdir()
+    d = artifacts / "work" / "scratch"
+    d.mkdir(parents=True)
     (d / reconcile.IGNORE_MARKER).write_text("")
     real = reconcile.append_event
 
@@ -428,4 +575,4 @@ def test_a_marker_whose_event_failed_is_announced_next_run(recon, monkeypatch):
     monkeypatch.setattr(reconcile, "append_event", real)
     reconcile.main()
 
-    assert [x["summary"] for x in _events(logs)] == ["Ignored tree: scratch"]
+    assert [x["summary"] for x in _events(logs)] == ["Ignored tree: work/scratch"]
