@@ -105,45 +105,67 @@ def main() -> None:
     found = 0
 
     errors: list[OSError] = []
+    item_errors: list[str] = []
     announced = load_markers()
     seen: set[str] = set()
     for f, ignored_tree in artifact_files(errors):
-        path_str = str(f)
-        if ignored_tree:
-            # identity, not mtime: a backdated or renamed-in marker must still be announced.
-            # lstat: a marker that is a dangling link still hides its tree, so it counts too.
-            key = f"{path_str}:{f.lstat().st_ino}"
-            seen.add(key)
-            if key in announced:
-                continue
-        elif not f.is_file() or f.stat().st_mtime <= cursor_mtime or path_str in known:
-            continue
-
-        event = build_event(
-            event_type="artifact.untracked",
-            source="reconciliation",
-            summary=(
-                f"Ignored tree: {f.parent.relative_to(ARTIFACTS_DIR)}"
-                if ignored_tree
-                else f"Untracked artifact: {f.name}"
-            ),
-            scope="cross-agent",
-            artifact_path=path_str,
-            hostname=HOSTNAME,
-        )
-        append_event(event, "cross-agent", LOGS_DIR)
-        found += 1
+        try:
+            found += _reconcile_one(f, ignored_tree, cursor_mtime, known, announced, seen)
+        except FileNotFoundError:
+            continue  # removed between the walk and the stat: nothing left to log
+        except Exception as e:  # one bad item (e.g. a non-UTF-8 name) must not stop the scan
+            item_errors.append(f"{os.fsencode(f)!r}: {type(e).__name__}")
 
     if found:
         print(f"reconcile: logged {found} untracked artifact(s)")
     # markers in unread dirs weren't seen; keep their keys rather than re-announce them later
-    save_markers(seen | announced if errors else seen)
-    if errors:
+    save_markers(seen | announced if errors or item_errors else seen)
+    if errors or item_errors:
         for e in errors:
             print(f"reconcile: could not read {e.filename}: {e.strerror}", file=sys.stderr)
-        # cursor not moved: the unread subtree is retried next run
+        for line in item_errors:
+            print(f"reconcile: could not log {line}", file=sys.stderr)
+        # cursor not moved: the unread or unlogged items are retried next run
         raise SystemExit(1)
     CURSOR_FILE.touch()
+
+
+def _reconcile_one(
+    f: Path,
+    ignored_tree: bool,
+    cursor_mtime: float,
+    known: set[str],
+    announced: set[str],
+    seen: set[str],
+) -> int:
+    """Log one artifact (or one marker). Returns 1 if an event was appended, else 0."""
+    path_str = str(f)
+    if ignored_tree:
+        # identity, not mtime: a backdated or renamed-in marker must still be announced.
+        # lstat: a marker that is a dangling link still hides its tree, so it counts too.
+        key = f"{path_str}:{f.lstat().st_ino}"
+        if key in announced:
+            seen.add(key)
+            return 0
+    elif not f.is_file() or f.stat().st_mtime <= cursor_mtime or path_str in known:
+        return 0
+
+    event = build_event(
+        event_type="artifact.untracked",
+        source="reconciliation",
+        summary=(
+            f"Ignored tree: {f.parent.relative_to(ARTIFACTS_DIR)}"
+            if ignored_tree
+            else f"Untracked artifact: {f.name}"
+        ),
+        scope="cross-agent",
+        artifact_path=path_str,
+        hostname=HOSTNAME,
+    )
+    append_event(event, "cross-agent", LOGS_DIR)
+    if ignored_tree:
+        seen.add(key)  # only once its event is on the log: a failed append re-announces next run
+    return 1
 
 
 if __name__ == "__main__":

@@ -376,3 +376,56 @@ def test_a_walk_error_keeps_announced_markers(recon, monkeypatch):
     with pytest.raises(SystemExit):
         reconcile.main()
     assert "/gone/elsewhere/.reconcile-ignore:1" in reconcile.MARKERS_FILE.read_text()
+
+
+def test_one_bad_item_does_not_stop_the_scan(recon, capsys):
+    """OV-33: a non-UTF-8 name can't be encoded into the log. It is reported, the rest is
+    logged, and the run fails loudly with the cursor held."""
+    _, artifacts, logs = recon
+    os.close(os.open(os.fsencode(artifacts) + b"/bad\xff.md", os.O_CREAT | os.O_WRONLY, 0o600))
+    (artifacts / "zz-good.md").write_text("x")
+
+    with pytest.raises(SystemExit) as e:
+        reconcile.main()
+
+    assert e.value.code == 1
+    assert [x["artifact_path"] for x in _events(logs)] == [str(artifacts / "zz-good.md")]
+    err = capsys.readouterr().err
+    assert "could not log" in err and "bad\\xff.md" in err
+    assert not reconcile.CURSOR_FILE.exists()
+
+
+def test_a_file_that_vanishes_mid_scan_is_skipped(recon, monkeypatch):
+    _, artifacts, logs = recon
+    (artifacts / "a.md").write_text("x")
+    real = reconcile.artifact_files
+
+    def files(errors):
+        yield artifacts / "gone.md", False
+        yield artifacts / "gone" / reconcile.IGNORE_MARKER, True
+        yield from real(errors)
+
+    monkeypatch.setattr(reconcile, "artifact_files", files)
+    reconcile.main()  # no SystemExit
+
+    assert [x["artifact_path"] for x in _events(logs)] == [str(artifacts / "a.md")]
+    assert reconcile.CURSOR_FILE.exists()
+
+
+def test_a_marker_whose_event_failed_is_announced_next_run(recon, monkeypatch):
+    _, artifacts, logs = recon
+    d = artifacts / "scratch"
+    d.mkdir()
+    (d / reconcile.IGNORE_MARKER).write_text("")
+    real = reconcile.append_event
+
+    def failing(event, *a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(reconcile, "append_event", failing)
+    with pytest.raises(SystemExit):
+        reconcile.main()
+    monkeypatch.setattr(reconcile, "append_event", real)
+    reconcile.main()
+
+    assert [x["summary"] for x in _events(logs)] == ["Ignored tree: scratch"]
