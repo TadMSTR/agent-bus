@@ -11,11 +11,12 @@ each prep dir), so there is no path-pattern list here to keep in step with them.
 is checked on every scan, whatever the files' mtimes, so one added after the files were
 written still collapses them.
 
-A marker is honoured only at depth 2 or deeper under artifacts/ (``audit-requests/<build>``
-and below; a prep dir is depth 3). One at the root or in a category dir (``build-plans/``,
-``audit-requests/``, ...) would end reconciliation of everything beneath it, so it is not
-honoured: that tree is scanned as usual, and the marker is logged as ``Marker not honoured:
-<dir>`` once a day for as long as it stays.
+A marker is honoured only at depth 3 or deeper under artifacts/ (``audit-requests/<build>/
+<dir>`` and below; a prep dir is exactly that). One higher up, at the root, in a category dir
+(``build-plans/``, ``audit-requests/``, ...) or in a build's own dir, would hide that build's
+requests, plans or every build in a category, so it is not honoured: that tree is scanned as
+usual, and the marker is logged as ``Marker not honoured: <dir>`` once a day for as long as it
+stays.
 
 What is announced is a marker's *placement*, once, not what it hides afterwards: a file
 written into an ignored tree later produces no event, by design. Any writer under artifacts/
@@ -26,9 +27,10 @@ corrupt or non-regular state file re-announces every marker. The state file is w
 the same uid as every agent, so a key written into it by hand hides a tree with no event at
 all (see SECURITY[accepted] at MARKERS_FILE).
 
-A name that is not valid UTF-8 is logged with its undecodable bytes backslash-escaped, so it
-lands as a normal event rather than failing every run. Two names that escape to the same
-string (``a\\xff`` written literally) share one dedup entry for the day.
+A name that is not valid UTF-8 is logged with its undecodable bytes escaped as ``\\xNN``, so it
+lands as a normal event rather than failing every run. A literal backslash in any name is
+logged doubled, so the escaping is one-to-one: no two names share a logged path, which is
+also the dedup key.
 
 A directory the walk cannot read is printed to stderr and the run exits 1 without moving
 the cursor, so the next run retries it, and the cron wrapper reports the failure. While the
@@ -65,8 +67,9 @@ CURSOR_FILE = COMMS_DIR / ".reconcile-cursor"
 MARKERS_FILE = COMMS_DIR / ".reconcile-markers.json"
 # Must match IGNORE_MARKER in host-forge-scripts security-check-prep.py, which writes it.
 IGNORE_MARKER = ".reconcile-ignore"
-# A marker shallower than this (the artifacts root is 0, a category dir is 1) is not honoured.
-MIN_MARKER_DEPTH = 2
+# A marker shallower than this is not honoured: the artifacts root is 0, a category dir 1, a
+# build's dir 2. security-check-prep.py writes its marker at audit-requests/<build>/prep, depth 3.
+MIN_MARKER_DEPTH = 3
 # The state holds only `path:inode` keys; anything larger is not ours. Read as unreadable.
 MARKERS_MAX_BYTES = 4 << 20
 HOSTNAME = os.uname().nodename
@@ -140,8 +143,9 @@ def save_markers(keys: set[str]) -> None:
 
 
 def _display(p: Path) -> str:
-    """``p`` as a str the log can encode: undecodable bytes are backslash-escaped."""
-    return os.fsencode(p).decode("utf-8", "backslashreplace")
+    """``p`` as a str the log can encode: undecodable bytes become ``\\xNN``. A literal backslash
+    is doubled first, so two different names can never display (and dedup) as the same str."""
+    return os.fsencode(p).replace(b"\\", b"\\\\").decode("utf-8", "backslashreplace")
 
 
 FILE, TREE, NOT_HONOURED = "file", "tree", "not-honoured"

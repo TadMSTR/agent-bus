@@ -15,7 +15,7 @@ When multiple Claude Code agents run concurrently — a dev agent, a security ag
 - A background federation loop replays events to NATS JetStream for downstream consumers —
   elected by an flock so exactly one process runs it, even when agent-bus is loaded as a module
   by several concurrent MCP clients
-- A reconciler catches artifacts (build plans, audit requests, handoffs) that were created without a corresponding log event. A directory holding a `.reconcile-ignore` file (a scratch tree such as an audit prep dir) is collapsed to one `Ignored tree: <dir>` event instead of one per file. Any writer can drop a marker, so its placement is logged once, by identity rather than mtime; files added under it afterwards are not. A marker at the artifacts root or in a category dir is not honoured (logged daily as `Marker not honoured: <dir>`, tree scanned as usual). The markers state is same-uid writable, so it is not a boundary against an agent
+- A reconciler catches artifacts (build plans, audit requests, handoffs) that were created without a corresponding log event. A directory holding a `.reconcile-ignore` file (a scratch tree such as an audit prep dir) is collapsed to one `Ignored tree: <dir>` event instead of one per file. Any writer can drop a marker, so its placement is logged once, by identity rather than mtime; files added under it afterwards are not. A marker shallower than three levels (the artifacts root, a category dir, a build's own dir) is not honoured (logged daily as `Marker not honoured: <dir>`, tree scanned as usual). The markers state is same-uid writable, so it is not a boundary against an agent
 
 ## Optional Components
 
