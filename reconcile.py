@@ -39,6 +39,12 @@ COMMS_DIR = Path(os.environ.get("AGENT_BUS_COMMS_DIR") or str(Path.home() / ".cl
 ARTIFACTS_DIR = COMMS_DIR / "artifacts"
 LOGS_DIR = COMMS_DIR / "logs"
 CURSOR_FILE = COMMS_DIR / ".reconcile-cursor"
+# SECURITY[accepted]: the markers state, like the cursor beside it, is writable by the same uid
+# as every agent whose artifacts this scans. An agent can pre-seed a marker's `path:inode` here
+# and hide its tree with no event, exactly as it can backdate .reconcile-cursor today. The
+# reconciler surfaces forgotten artifacts; it has never been a boundary against a same-uid
+# agent. Closing it needs per-agent UIDs, vikunja#404. Accepted by the operator 2026-11-01.
+# Audit: 2026-11-01/audit-workflow-2026-11-p1-round-capture (pre-audit OV-40).
 MARKERS_FILE = COMMS_DIR / ".reconcile-markers.json"
 IGNORE_MARKER = ".reconcile-ignore"
 HOSTNAME = os.uname().nodename
