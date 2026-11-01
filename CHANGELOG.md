@@ -10,20 +10,22 @@ All notable changes to this project will be documented in this file.
   event: the marker itself is logged (`Ignored tree: <dir>`), and its siblings and everything
   below are not. Whoever writes a scratch tree drops the marker in its root; there is no
   path-pattern list. It is checked on every scan, so a marker added after the files still
-  collapses them, and a skip is never silent (a dangling-link marker is logged too). One audit
+  collapses them, and a skip is never silent: markers are announced by path and inode
+  (`.reconcile-markers.json`), not by mtime, so a backdated, renamed-in or dangling-link marker
+  is still logged. One audit
   prep dir used to log about 40 `artifact.untracked` events, one per batch, view and patch file.
-
-### Fixed
-
-- `reconcile.py`: a directory the walk can't read is printed to stderr and the run exits 1
-  without moving the cursor, so it is retried next run. Before, it read as empty and the
-  cursor moved past it.
 
 - Vocabulary: `subagent.started` and `subagent.stopped`, emitted by a managed Claude Code hook,
   `subagent-lifecycle-log.py` (Claude Code `SubagentStart`/`SubagentStop` hooks) with the
   subagent's type and id and the parent session, never its prompt or output; and
   `subagent.write_denied`, emitted by `subagent-write-scope-hook.py` when a scoped subagent
   edits outside its assignment. All cross-agent.
+
+### Fixed
+
+- `reconcile.py`: a directory the walk can't read is printed to stderr and the run exits 1
+  without moving the cursor, so it is retried next run. Before, it read as empty and the
+  cursor moved past it.
 
 ## [0.6.0] — 2026-10-30
 

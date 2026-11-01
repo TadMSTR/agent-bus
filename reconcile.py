@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 reconcile.py — scan ~/.claude/comms/artifacts/ for files not yet in today's cross-agent log.
-Runs every 5 minutes via PM2 cron. Writes directly to JSONL (not via MCP) since it IS
+Runs every 5 minutes from the ted crontab, through hc-run (the PM2 entry in ecosystem.config.js
+is not started). Writes directly to JSONL (not via MCP) since it IS
 the agent-bus reconciliation path.
 
 A directory that contains a ``.reconcile-ignore`` file is collapsed to one event: the marker
@@ -10,11 +11,16 @@ not. Whoever writes a scratch tree owns its marker (security-check-prep.py write
 each prep dir), so there is no path-pattern list here to keep in step with them. The marker
 is checked on every scan, whatever the files' mtimes, so one added after the files were
 written still collapses them. A skip is never silent: any writer under artifacts/ can drop a
-marker, and the event is what shows where one was dropped.
+marker, and the event is what shows where one was dropped. A marker is announced by identity
+(path and inode, kept in ``.reconcile-markers.json`` beside the cursor), not by mtime, so a
+backdated marker, or an old file renamed into place, is still announced. An unreadable or
+corrupt state file re-announces every marker: noisy, never silent.
 
 A directory the walk cannot read is printed to stderr and the run exits 1 without moving
-the cursor, so the next run retries it (the intra-day dedup keeps that from re-logging), and
-hc-run reports the failure. Before this, an unreadable subtree read as empty.
+the cursor, so the next run retries it, and hc-run reports the failure. While the cursor is
+held, the dedup is today's log only, so an error that persists past midnight re-logs what is
+newer than the cursor once more: a repeat, never a loss. Before this, an unreadable subtree
+read as empty.
 
 Appends through ``event_log`` so its events chain and lock like every other writer's.
 It previously appended raw, with no ``prev_hash`` and no lock — which meant a PM2 cron
@@ -33,6 +39,7 @@ COMMS_DIR = Path(os.environ.get("AGENT_BUS_COMMS_DIR") or str(Path.home() / ".cl
 ARTIFACTS_DIR = COMMS_DIR / "artifacts"
 LOGS_DIR = COMMS_DIR / "logs"
 CURSOR_FILE = COMMS_DIR / ".reconcile-cursor"
+MARKERS_FILE = COMMS_DIR / ".reconcile-markers.json"
 IGNORE_MARKER = ".reconcile-ignore"
 HOSTNAME = os.uname().nodename
 
@@ -63,6 +70,21 @@ def known_artifact_paths() -> set[str]:
     return paths
 
 
+def load_markers() -> set[str]:
+    """Identities of markers already announced. Anything unreadable reads as none."""
+    try:
+        data = json.loads(MARKERS_FILE.read_text())
+        return {k for k in data if isinstance(k, str)} if isinstance(data, list) else set()
+    except Exception:
+        return set()
+
+
+def save_markers(keys: set[str]) -> None:
+    tmp = MARKERS_FILE.with_name(MARKERS_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(sorted(keys)))
+    os.replace(tmp, MARKERS_FILE)
+
+
 def artifact_files(errors: list[OSError]):
     """(path, ignored_tree) for every file to log: each file outside an ignored tree, and the
     marker of each ignored tree. Directory links are not followed. Walk errors are appended
@@ -83,18 +105,18 @@ def main() -> None:
     found = 0
 
     errors: list[OSError] = []
+    announced = load_markers()
+    seen: set[str] = set()
     for f, ignored_tree in artifact_files(errors):
-        if ignored_tree:
-            # lstat: a marker that is a dangling link still hides its tree, so it is logged too
-            mtime = f.lstat().st_mtime
-        elif f.is_file():
-            mtime = f.stat().st_mtime
-        else:
-            continue
-        if mtime <= cursor_mtime:
-            continue
         path_str = str(f)
-        if path_str in known:
+        if ignored_tree:
+            # identity, not mtime: a backdated or renamed-in marker must still be announced.
+            # lstat: a marker that is a dangling link still hides its tree, so it counts too.
+            key = f"{path_str}:{f.lstat().st_ino}"
+            seen.add(key)
+            if key in announced:
+                continue
+        elif not f.is_file() or f.stat().st_mtime <= cursor_mtime or path_str in known:
             continue
 
         event = build_event(
@@ -114,6 +136,8 @@ def main() -> None:
 
     if found:
         print(f"reconcile: logged {found} untracked artifact(s)")
+    # markers in unread dirs weren't seen; keep their keys rather than re-announce them later
+    save_markers(seen | announced if errors else seen)
     if errors:
         for e in errors:
             print(f"reconcile: could not read {e.filename}: {e.strerror}", file=sys.stderr)

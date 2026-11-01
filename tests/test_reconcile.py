@@ -24,6 +24,7 @@ def recon(tmp_path, monkeypatch):
     monkeypatch.setattr(reconcile, "ARTIFACTS_DIR", artifacts)
     monkeypatch.setattr(reconcile, "LOGS_DIR", logs)
     monkeypatch.setattr(reconcile, "CURSOR_FILE", tmp_path / ".reconcile-cursor")
+    monkeypatch.setattr(reconcile, "MARKERS_FILE", tmp_path / ".reconcile-markers.json")
     return tmp_path, artifacts, logs
 
 
@@ -212,10 +213,78 @@ def test_a_marker_is_logged_once(recon):
     (prep / reconcile.IGNORE_MARKER).write_text("")
 
     reconcile.main()
-    reconcile.CURSOR_FILE.unlink()  # only the intra-day dedup stands between it and a repeat
+    reconcile.CURSOR_FILE.unlink()  # not the cursor, not the day's log: the state decides
+    (logs / next(logs.iterdir()).name).unlink()
+    reconcile.main()
+
+    assert _marker_events(_events(logs)) == []
+
+
+def _backdate(p, by=10_000):
+    t = reconcile.CURSOR_FILE.stat().st_mtime - by
+    os.utime(p, (t, t), follow_symlinks=False)
+
+
+def test_a_backdated_marker_is_still_announced(recon):
+    """OV-40/OV-01 round 2: the marker is not subject to the mtime cursor."""
+    _, artifacts, logs = recon
+    reconcile.main()  # sets the cursor
+    d = artifacts / "scratch"
+    d.mkdir()
+    (d / "a.md").write_text("x")
+    _backdate(d / "a.md")
+    (d / reconcile.IGNORE_MARKER).write_text("")
+    _backdate(d / reconcile.IGNORE_MARKER)
+
+    reconcile.main()
+
+    assert [e["summary"] for e in _events(logs)] == ["Ignored tree: scratch"]
+
+
+def test_an_old_file_renamed_onto_the_marker_is_announced(recon):
+    _, artifacts, logs = recon
+    d = artifacts / "scratch"
+    d.mkdir()
+    old = d / "old.md"
+    old.write_text("x")
+    reconcile.main()  # logs old.md, sets the cursor
+    _backdate(old)
+    old.rename(d / reconcile.IGNORE_MARKER)
+
+    reconcile.main()
+
+    assert [e["summary"] for e in _events(logs)][-1] == "Ignored tree: scratch"
+
+
+def test_a_replaced_marker_is_announced_again(recon):
+    _, artifacts, logs = recon
+    d = artifacts / "scratch"
+    d.mkdir()
+    m = d / reconcile.IGNORE_MARKER
+    m.write_text("")
+    reconcile.main()
+    tmp = d / "new"
+    tmp.write_text("")
+    m.unlink()
+    tmp.rename(m)  # new inode at the same path
+    (logs / next(logs.iterdir()).name).unlink()  # and not saved by the day's dedup
+
     reconcile.main()
 
     assert len(_marker_events(_events(logs))) == 1
+
+
+def test_a_corrupt_state_file_re_announces(recon):
+    _, artifacts, logs = recon
+    d = artifacts / "scratch"
+    d.mkdir()
+    (d / reconcile.IGNORE_MARKER).write_text("")
+    reconcile.main()
+    (logs / next(logs.iterdir()).name).unlink()
+    for bad in ("{nope", "{}", "[1, 2]"):
+        reconcile.MARKERS_FILE.write_text(bad)
+        reconcile.main()
+    assert len(_marker_events(_events(logs))) == 3  # noisy, never silent
 
 
 def test_a_marker_added_after_the_files_still_hides_them(recon):
@@ -292,3 +361,18 @@ def test_an_unreadable_directory_fails_the_run_and_holds_the_cursor(recon, monke
     assert "could not read" in err and str(artifacts / "locked") in err
     assert not reconcile.CURSOR_FILE.exists()
     assert len(_events(logs)) == 1  # what it could read is still logged
+
+
+def test_a_walk_error_keeps_announced_markers(recon, monkeypatch):
+    _, artifacts, _ = recon
+    reconcile.MARKERS_FILE.write_text('["/gone/elsewhere/.reconcile-ignore:1"]')
+    real_walk = os.walk
+
+    def walk(top, onerror=None, **kw):
+        onerror(PermissionError(13, "Permission denied", str(artifacts / "locked")))
+        yield from real_walk(top, onerror=onerror, **kw)
+
+    monkeypatch.setattr(reconcile.os, "walk", walk)
+    with pytest.raises(SystemExit):
+        reconcile.main()
+    assert "/gone/elsewhere/.reconcile-ignore:1" in reconcile.MARKERS_FILE.read_text()
