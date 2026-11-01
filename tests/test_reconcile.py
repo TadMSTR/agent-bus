@@ -573,6 +573,30 @@ def test_a_linked_or_oversized_state_file_reads_as_none(recon, tmp_path):
     assert reconcile.load_markers() == set()
 
 
+def test_a_failed_save_reports_every_error_and_holds_the_cursor(recon, monkeypatch, capsys):
+    """Round-2 R2-02: a directory planted at the tmp path made save_markers raise a traceback
+    before the collected item errors were printed. Now every line is printed, then exit 1."""
+    _, artifacts, _ = recon
+    (artifacts / "bad.md").write_text("x")
+    real = reconcile.append_event
+
+    def append(event, *a, **k):
+        if event["artifact_path"].endswith("bad.md"):
+            raise OSError("disk full")
+        return real(event, *a, **k)
+
+    monkeypatch.setattr(reconcile, "append_event", append)
+    reconcile.MARKERS_FILE.with_name(reconcile.MARKERS_FILE.name + ".tmp").mkdir()
+    with pytest.raises(SystemExit) as e:
+        reconcile.main()
+
+    assert e.value.code == 1
+    err = capsys.readouterr().err
+    assert "could not log" in err and "bad.md" in err
+    assert "could not save markers state" in err
+    assert not reconcile.CURSOR_FILE.exists()
+
+
 def test_save_markers_does_not_write_through_a_planted_tmp_link(recon, tmp_path):
     victim = tmp_path / "victim"
     victim.write_text("keep")

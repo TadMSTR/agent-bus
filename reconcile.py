@@ -17,8 +17,9 @@ as ``build-plans/``, or a dir directly under one such as ``audit-requests/<build
 every build in a category or a build's requests, so it is not honoured: that tree is scanned as
 usual, and the marker is logged as ``Marker not honoured: <dir>`` once a day for as long as it
 stays. Depth is the whole test. It guards against a marker dropped one level too high; it does
-not know what a scratch dir is, so a deeper marker is honoured wherever it is, including in an
-archived build's dir (``build-plans/archive/<build>/``) or a nested request dir.
+not know what a scratch dir is, so a deeper marker is honoured wherever it is: most often a
+programme part's plan dir (``build-plans/<programme>/<part>/``, where most live plans sit),
+an archived build's dir (``build-plans/archive/<build>/``) or a nested request dir.
 
 What is announced is a marker's *placement*, once, not what it hides afterwards: a file
 written into an ignored tree later produces no event, by design. Any writer under artifacts/
@@ -205,13 +206,18 @@ def main() -> None:
 
     if found:
         print(f"reconcile: logged {found} untracked artifact(s)")
-    # markers in unread dirs weren't seen; keep their keys rather than re-announce them later
-    save_markers(seen | announced if errors or item_errors else seen)
+    for e in errors:
+        print(f"reconcile: could not read {e.filename}: {e.strerror}", file=sys.stderr)
+    for line in item_errors:
+        print(f"reconcile: could not log {line}", file=sys.stderr)
+    # markers in unread dirs weren't seen; keep their keys rather than re-announce them later.
+    # A failed save is one more error line, not a traceback that hides the ones above.
+    try:
+        save_markers(seen | announced if errors or item_errors else seen)
+    except OSError as e:
+        print(f"reconcile: could not save markers state: {type(e).__name__}", file=sys.stderr)
+        raise SystemExit(1) from None
     if errors or item_errors:
-        for e in errors:
-            print(f"reconcile: could not read {e.filename}: {e.strerror}", file=sys.stderr)
-        for line in item_errors:
-            print(f"reconcile: could not log {line}", file=sys.stderr)
         # cursor not moved: the unread or unlogged items are retried next run
         raise SystemExit(1)
     CURSOR_FILE.touch()

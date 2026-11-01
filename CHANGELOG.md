@@ -6,8 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- `reconcile.py` collapses any directory that contains a `.reconcile-ignore` file to one
-  event: the marker itself is logged (`Ignored tree: <dir>`), and its siblings and everything
+- `reconcile.py` collapses a directory three or more levels below `artifacts/` that contains
+  a `.reconcile-ignore` file to one event: the marker itself is logged (`Ignored tree: <dir>`), and its siblings and everything
   below are not. Whoever writes a scratch tree drops the marker in its root; there is no
   path-pattern list. It is checked on every scan, so a marker added after the files still
   collapses them. A marker's placement is announced once, by path and inode
