@@ -264,3 +264,10 @@ def test_subagent_events_are_declared_cross_agent(event_type):
     assert event_type in event_vocab.CROSS_AGENT_EVENTS
     assert event_type not in event_vocab.SESSION_EVENTS
     assert event_vocab.unknown_event_reason(event_type, "enforce") is None
+
+
+def test_audit_baseline_completed_is_declared_cross_agent():
+    """security-baseline emits it once per pre-audit; strict mode must accept it."""
+    assert "audit.baseline.completed" in event_vocab.CROSS_AGENT_EVENTS
+    assert "audit.baseline.completed" not in event_vocab.SESSION_EVENTS
+    assert event_vocab.unknown_event_reason("audit.baseline.completed", "enforce") is None
