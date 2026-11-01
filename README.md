@@ -15,7 +15,7 @@ When multiple Claude Code agents run concurrently — a dev agent, a security ag
 - A background federation loop replays events to NATS JetStream for downstream consumers —
   elected by an flock so exactly one process runs it, even when agent-bus is loaded as a module
   by several concurrent MCP clients
-- A reconciler catches artifacts (build plans, audit requests, handoffs) that were created without a corresponding log event
+- A reconciler catches artifacts (build plans, audit requests, handoffs) that were created without a corresponding log event. A directory holding a `.reconcile-ignore` file (a scratch tree such as an audit prep dir) is collapsed to one `Ignored tree: <dir>` event instead of one per file. Any writer can drop a marker, so its placement is logged once, by identity rather than mtime; files added under it afterwards are not. A marker shallower than three levels (the artifacts root, a category dir, or a dir directly under one such as `audit-requests/<build>/`) is not honoured (logged daily as `Marker not honoured: <dir>`, tree scanned as usual); depth is the only test, so a deeper marker is honoured anywhere. The markers state is same-uid writable, so it is not a boundary against an agent
 
 ## Optional Components
 
@@ -384,7 +384,8 @@ $AGENT_BUS_COMMS_DIR/          (default: ~/.claude/comms)
 ├── outbox/<producer>/                  # producer outboxes (see Producer Outboxes)
 ├── outbox-status.json                 # the drainer's heartbeat, read by get_status
 ├── federation-cursor.json             # NATS federation offset tracker
-└── .reconcile-cursor                  # reconciler mtime watermark
+├── .reconcile-cursor                  # reconciler mtime watermark
+└── .reconcile-markers.json            # .reconcile-ignore markers already announced (path:inode)
 ```
 
 Each JSONL line is a complete event object:

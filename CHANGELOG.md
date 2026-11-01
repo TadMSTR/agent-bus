@@ -6,11 +6,40 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `reconcile.py` collapses a directory three or more levels below `artifacts/` that contains
+  a `.reconcile-ignore` file to one event: the marker itself is logged (`Ignored tree: <dir>`), and its siblings and everything
+  below are not. Whoever writes a scratch tree drops the marker in its root; there is no
+  path-pattern list. It is checked on every scan, so a marker added after the files still
+  collapses them. A marker's placement is announced once, by path and inode
+  (`.reconcile-markers.json`), not by mtime, so a backdated, renamed-in or dangling-link marker
+  is still logged; files added under it later are not. A marker is honoured only three or more
+  levels below `artifacts/` (an audit prep dir is exactly three): one at depth 0-2 (the root,
+  a category dir, or a dir directly under one such as `audit-requests/<build>/`) is logged as
+  `Marker not honoured: <dir>` once a day and its tree is scanned as usual. Depth is the only
+  test, so a deeper marker is honoured anywhere, an archived build's dir included. The markers state is writable
+  by every agent's uid, so a key written into it by hand hides a tree with no event; that is
+  an accepted residual of the shared uid. One audit prep dir used to log about 40
+  `artifact.untracked` events, one per batch, view and patch file.
+
 - Vocabulary: `subagent.started` and `subagent.stopped`, emitted by a managed Claude Code hook,
   `subagent-lifecycle-log.py` (Claude Code `SubagentStart`/`SubagentStop` hooks) with the
   subagent's type and id and the parent session, never its prompt or output; and
   `subagent.write_denied`, emitted by `subagent-write-scope-hook.py` when a scoped subagent
   edits outside its assignment. All cross-agent.
+
+### Fixed
+
+- `reconcile.py`: a directory the walk can't read is printed to stderr and the run exits 1
+  without moving the cursor, so it is retried next run. Before, it read as empty and the
+  cursor moved past it.
+- `reconcile.py`: a file name that isn't valid UTF-8 is logged with its bad bytes escaped as
+  `\xNN`, and a literal backslash is doubled so no two names log the same path. It used to
+  fail every run and hold the cursor until someone removed it.
+- `reconcile.py` reads `.reconcile-markers.json` only if it is a regular file of at most
+  4 MiB, and writes its temp file without following links. A FIFO there used to hang the run.
+  A state file that exists but is refused is reported on stderr.
+- `reconcile.py`: a marker removed between the walk and its check now fails the run and holds
+  the cursor, so the files beside it are scanned next run instead of being passed over.
 
 ## [0.6.0] — 2026-10-30
 
