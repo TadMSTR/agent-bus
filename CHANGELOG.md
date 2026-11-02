@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-11-01
+
 ### Added
 
 - `reconcile.py` collapses a directory three or more levels below `artifacts/` that contains
@@ -26,6 +28,11 @@ All notable changes to this project will be documented in this file.
   subagent's type and id and the parent session, never its prompt or output; and
   `subagent.write_denied`, emitted by `subagent-write-scope-hook.py` when a scoped subagent
   edits outside its assignment. All cross-agent.
+
+- Vocabulary: `audit.baseline.completed`, emitted once per pre-audit pass by the
+  `security-baseline` skill with the build, round, side, verdict counts and the kb-checkers'
+  usage totals (host-forge-scripts `audit-round-ledger.py --summary`). Cross-agent
+  (audit-workflow-2026-11 p2).
 
 ### Fixed
 

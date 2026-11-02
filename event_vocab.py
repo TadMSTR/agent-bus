@@ -140,6 +140,11 @@ CROSS_AGENT_EVENTS = frozenset(
         # a managed PreToolUse hook (subagent-write-scope-hook.py): an edit by a scoped type
         # (doc-drafter) outside its parent's assignment, refused.
         "subagent.write_denied",
+        # the security-baseline skill, once per pre-audit pass (audit-workflow-2026-11 p2):
+        # build, round, side, verdict counts and the checkers' usage totals, as computed by
+        # host-forge-scripts audit-round-ledger.py --summary. Cross-agent: the operator's
+        # audit-round review reads it beside subagent.stopped.
+        "audit.baseline.completed",
     }
 )
 
