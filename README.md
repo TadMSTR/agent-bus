@@ -80,7 +80,7 @@ the run on failure, and that only works under `set -e` in a script.
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-VERSION=0.6.0
+VERSION=0.7.0
 REPO=~/repos/agent-bus
 PY=/usr/bin/python3.13
 die() { echo "install: $*" >&2; exit 1; }
