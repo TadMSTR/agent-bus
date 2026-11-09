@@ -173,13 +173,16 @@ VERIFY_SIGNATURES: str = os.environ.get("AGENT_BUS_VERIFY_SIGNATURES", "warn")
 # as an empty string rather than absent — hence `or`, not a dict default.
 STRICT_VOCAB: str = os.environ.get("AGENT_BUS_STRICT_VOCAB") or "warn"
 
-# Replay window for signature version 2+. See _check_replay.
-SIG_MAX_AGE_SECONDS = _env_num("AGENT_BUS_SIG_MAX_AGE", 300, int)
+# Replay window for signature version 2+. See _check_replay. 120 s since 0.7.1 (was 300),
+# vikunja#434: the window, not the per-process nonce set, is the guarantee that holds
+# across every agent-bus process, so it is kept as short as delivery allows. A signed event
+# reaches agent-bus within one stdio round trip of signing; outbox events are unsigned.
+SIG_MAX_AGE_SECONDS = _env_num("AGENT_BUS_SIG_MAX_AGE", 120, int)
 
 # Seen nonces, keyed by nonce with the monotonic time they were first accepted. Entries
 # are evicted when they age out of the freshness window (see _prune_nonces), so eviction
 # is driven by the clock rather than by insertion volume. The hard cap below is only a
-# memory backstop; at forge's observed rate (~40 cross-agent events/day) a 300s window
+# memory backstop; at forge's observed rate (~40 cross-agent events/day) a 120s window
 # holds single digits, so it should never be reached in normal operation.
 _SEEN_NONCE_LIMIT = 16384
 _seen_nonces: OrderedDict[str, float] = OrderedDict()

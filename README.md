@@ -180,7 +180,7 @@ Configure as an MCP server in your Claude Desktop or Claude Code settings:
 | `AGENT_BUS_WEBHOOK_URL` | — | URL to POST event JSON to (optional) |
 | `AGENT_BUS_WEBHOOK_EVENTS` | — | Comma-separated event types to fire on, or `*` for all (optional) |
 | `AGENT_BUS_VERIFY_SIGNATURES` | `warn` | `warn` (log and accept) or `enforce` (reject unsigned events and events from unregistered sources) — see [Signing & Verification](#signing--verification) |
-| `AGENT_BUS_SIG_MAX_AGE` | `300` | Freshness window, in seconds, for `sig_v: 2` signatures |
+| `AGENT_BUS_SIG_MAX_AGE` | `120` | Freshness window, in seconds, for `sig_v: 2` signatures (300 before 0.7.1) |
 | `AGENT_BUS_STRICT_VOCAB` | `warn` | `off`, `warn` (log and accept) or `enforce` (reject) for an event type in neither vocabulary — see [Event Vocabulary](#event-vocabulary) |
 | `AGENT_BUS_FEDERATION` | `1` | Set `0` to disable the federation loop entirely |
 | `AGENT_BUS_FEDERATION_INTERVAL` | `30` | Seconds between federation cycles |

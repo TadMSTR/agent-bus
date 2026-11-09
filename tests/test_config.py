@@ -83,7 +83,8 @@ def test_defaults_are_used_when_every_var_is_empty():
         "server.FEDERATION_MAX_SECONDS_PER_CYCLE, "
         "server.SIG_MAX_AGE_SECONDS)",
     )
-    assert values == "(500, 10.0, 300)"
+    # SIG_MAX_AGE_SECONDS is 120 since 0.7.1 (vikunja#434); it was 300.
+    assert values == "(500, 10.0, 120)"
 
 
 def test_strict_vocab_falls_back_to_warn_when_empty():
@@ -119,3 +120,8 @@ def test_explicit_values_override_the_defaults():
         overrides, "(server.FEDERATION_INTERVAL, server.SIG_MAX_AGE_SECONDS)"
     )
     assert values == "(5, 60)"
+
+
+def test_sig_max_age_defaults_to_120_seconds():
+    """vikunja#434: the replay window is 120 s unless AGENT_BUS_SIG_MAX_AGE says otherwise."""
+    assert _import_server_with({}, "server.SIG_MAX_AGE_SECONDS") == "120"

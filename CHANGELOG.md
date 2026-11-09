@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-11-09
+
+### Changed
+
+- The freshness window for `sig_v >= 2` signatures, `AGENT_BUS_SIG_MAX_AGE`, now defaults to
+  **120 s** (was 300 s). The variable still overrides it. scoped-mcp 1.22.0's signing hook
+  emits `sig_v: 2` with `sig_ts` and `sig_nonce`, so the window is now live: with
+  per-process nonce sets, it is the replay bound that holds across every agent-bus process
+  (vikunja#434). In `warn`, the default, a stale or replayed signature is logged and
+  accepted, as before; `enforce` rejects it. AGENTS.md and the README state the guarantee
+  with the new value.
+
 ## [0.7.0] — 2026-11-01
 
 ### Added
