@@ -54,7 +54,7 @@ ntfy and webhook delivery shell out to `curl`; there is no HTTP client dependenc
 | `NATS_AGENT_BUS_USER`              | `agent-bus`         | NATS username                                        |
 | `NATS_AGENT_BUS_PASSWORD`          | —                   | NATS password. Unset disables publishing entirely.   |
 | `AGENT_BUS_VERIFY_SIGNATURES`      | `warn`              | `warn` (log and accept) or `enforce` (reject)        |
-| `AGENT_BUS_SIG_MAX_AGE`            | `300`               | Freshness window, seconds, for `sig_v>=2` signatures |
+| `AGENT_BUS_SIG_MAX_AGE`            | `120`               | Freshness window, seconds, for `sig_v>=2` signatures (300 before 0.7.1) |
 | `NTFY_URL`                         | —                   | ntfy push for high-priority events                   |
 | `AGENT_BUS_WEBHOOK_URL`            | —                   | Webhook endpoint for event delivery                  |
 | `AGENT_BUS_WEBHOOK_EVENTS`         | —                   | Comma-separated event types to forward (`*` = all)   |
@@ -119,11 +119,16 @@ ntfy and webhook delivery shell out to `curl`; there is no HTTP client dependenc
   *different* process than the one that first saw it will not be caught by the nonce
   check. The guarantee that holds across all processes is the cryptographically-signed
   `sig_ts` freshness window — **"valid signature, seen at most once per process, and at
-  most ±`AGENT_BUS_SIG_MAX_AGE` old"** (default 300s, ± because clock skew between agents
-  is tolerated). Size `AGENT_BUS_SIG_MAX_AGE` to the replay exposure you are willing to
-  accept, not to the nonce cache. Sharing the nonce set across processes was considered
-  and rejected: it puts locked file I/O on the hot path of every signed event for all
-  seven agents. Revisit when vikunja#434 makes any of this live.
+  most ±`AGENT_BUS_SIG_MAX_AGE` old"** (default 120s since 0.7.1, ± because clock skew
+  between agents is tolerated). Size `AGENT_BUS_SIG_MAX_AGE` to the replay exposure you
+  are willing to accept, not to the nonce cache. Sharing the nonce set across processes was
+  considered and rejected: it puts locked file I/O on the hot path of every signed event
+  for every agent. Decided with vikunja#434 (2026-11-09), when scoped-mcp 1.22.0 started
+  emitting `sig_v: 2`: per-process nonces are accepted, and the window went from 300 s to
+  120 s instead. Only the live `log_event` path is signed (outbox events are not), and a
+  signed event arrives within one stdio round trip, so 120 s is wide for delivery. In
+  `warn` (the default) a replay or a stale signature is logged and accepted; only
+  `enforce` rejects it.
 
 ## Testing
 
