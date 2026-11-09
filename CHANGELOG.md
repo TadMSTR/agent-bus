@@ -14,7 +14,8 @@ All notable changes to this project will be documented in this file.
   per-process nonce sets, it is the replay bound that holds across every agent-bus process
   (vikunja#434). In `warn`, the default, a stale or replayed signature is logged and
   accepted, as before; `enforce` rejects it. AGENTS.md and the README state the guarantee
-  with the new value.
+  with the new value. `.env.example` now sets 120 as well; a deployment copied from the
+  old example kept 300 explicitly.
 
 ## [0.7.0] — 2026-11-01
 
