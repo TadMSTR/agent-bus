@@ -15,12 +15,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # This job holds contents: write; leave no token in .git/config.
+          # This job holds contents: write; leave no token in .git/config. gh reads
+          # GH_TOKEN from the step env instead.
           persist-credentials: false
 
+      # gh is preinstalled on the runner, so no third-party action holds this job's
+      # contents: write token.
       - name: Create release
-        uses: softprops/action-gh-release@c062e08bd532815e2082a85e87e3ef29c3e6d191 # v2.2.1
-        with:
-          generate_release_notes: false
-          body: |
-            See [CHANGELOG.md](https://github.com/TadMSTR/agent-bus/blob/main/CHANGELOG.md) for what's in this release.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if gh release view "${TAG_NAME}" &>/dev/null; then
+            echo "Release ${TAG_NAME} already exists; nothing to do."
+          else
+            gh release create "${TAG_NAME}" \
+              --title "${TAG_NAME}" \
+              --notes "See [CHANGELOG.md](https://github.com/TadMSTR/agent-bus/blob/main/CHANGELOG.md) for what's in this release." \
+              --verify-tag
+          fi

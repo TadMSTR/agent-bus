@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-11-15
+
+Dependency release. No application code changed.
+
+### Security
+
+- **dnspython 2.9.2** (CVE-2026-128089). The `server` extra now floors `dnspython>=2.9.2`
+  and `uv.lock` pins 2.9.2 (was 2.9.1). No request reaches dnspython; the floor keeps a
+  re-resolve from keeping the vulnerable release.
+- **opentelemetry-api floor raised to `>=1.45.2`** (CVE-2026-126360). The lock already
+  pinned 1.45.2; the floor now matches, for an install that re-resolves.
+
+### Changed
+
+- **The release workflow no longer uses a third-party action.** `release.yml` pinned
+  `softprops/action-gh-release` at a SHA whose comment named v2.2.1, but the SHA was the
+  v2.0.8 tag. The step now runs the runner's own `gh release create --verify-tag`, and
+  does nothing if the release already exists. The release notes still point to this file.
+
 ## [0.7.1] — 2026-11-09
 
 ### Changed
